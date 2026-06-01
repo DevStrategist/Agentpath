@@ -174,7 +174,12 @@ case "$verb" in
     # Spawn as keyring-proxy uid, fully detached, stdio to log
     touch "$PROXY_LOG_FILE" 2>/dev/null || true
     chown "$PROXY_USER:$PROXY_GROUP" "$PROXY_LOG_FILE" 2>/dev/null || true
+    if [[ -f /var/lib/keyring/proxy.env ]]; then
+      chown "root:$PROXY_GROUP" /var/lib/keyring/proxy.env 2>/dev/null || true
+      chmod 640 /var/lib/keyring/proxy.env 2>/dev/null || true
+    fi
     proxy_launch='
+      cd /var/empty 2>/dev/null || cd /tmp
       if [ -f /var/lib/keyring/proxy.env ]; then
         set -a
         . /var/lib/keyring/proxy.env
