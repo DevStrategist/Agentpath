@@ -1,0 +1,13 @@
+{
+  "name": "keyring",
+  "version": "0.1.0",
+  "description": "Policy egress proxy for AI agents — host-gated, human-approved, credential-free.",
+  "bin": { "keyring": "bin/keyring" },
+  "scripts": {
+    "demo": "bash demo/run-demo.sh",
+    "test": "node test/core.test.js",
+    "serve": "node bin/keyring serve",
+    "start": "node bin/keyring serve"
+  },
+  "license": "MIT"
+}

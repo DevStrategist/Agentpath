@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# /usr/local/libexec/keyring-helper — privileged operations for KEYRING.
+#
+# Single entry point for everything that needs root. Must be invoked via sudo.
+# Inputs are validated (cli names, bin paths, ports); the helper only touches
+# files inside KEYRING-owned namespaces:
+#   - /etc/pf.anchors/keyring*
+#   - /etc/pf.keyring.conf
+#   - /etc/sudoers.d/keyring*
+#   - <bin> and <bin>.keyring-real for caller-supplied <bin> matching an allowed prefix
+#
+# After `keyring install` runs once, /etc/sudoers.d/keyring permits the
+# original user to invoke THIS specific binary as root without a password,
+# so subsequent calls from the CLI/dashboard are silent.
+#
+# Verbs (each prints a single JSON line on stdout):
+#   jail-up    <proxy-port>
+#   jail-down
+#   jail-status
+#   shim-install   <cli-name> <bin-path> <proxy-port> <invoking-user>
+#   shim-uninstall <cli-name> <bin-path>
+#   self-uninstall
+#
+# Exit codes: 0 success, non-zero failure (with {"error":"..."} on stdout).
+
+set -u
+umask 022
+
+JAIL_USER="keyring-jail"
+JAIL_GROUP="keyring-jail"
+PROXY_USER="keyring-proxy"
+PROXY_GROUP="keyring-proxy"
+ANCHOR_NAME="keyring"
+ANCHOR_FILE="/etc/pf.anchors/${ANCHOR_NAME}"
+ANCHOR_CONF="/etc/pf.${ANCHOR_NAME}.conf"
+PROXY_PID_FILE="/var/run/keyring-proxy.pid"
+PROXY_LOG_FILE="/var/log/keyring-proxy.log"
+HELPER_PATH="/usr/local/libexec/keyring-helper"
+SUDOERS_FILE="/etc/sudoers.d/keyring"
+ALLOWED_BIN_PREFIXES=(/usr/local/bin /opt/homebrew/bin /usr/bin /usr/sbin /bin /sbin)
+LOG="/var/log/keyring-helper.log"
+
+j_ok()   { printf '{"ok":true,%s}\n' "$1"; exit 0; }
+j_err()  { printf '{"ok":false,"error":"%s"}\n' "$1"; exit 1; }
+log()    { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*" >> "$LOG" 2>/dev/null || true; }
+
+[[ $EUID -eq 0 ]] || j_err "must_invoke_via_sudo"
+[[ "$(uname)" == "Darwin" ]] || j_err "darwin_only"
+
+# --- validators ---
+valid_name() { [[ "${1:-}" =~ ^[a-zA-Z0-9._-]{1,64}$ ]]; }
+valid_port() { [[ "${1:-}" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 )); }
+valid_user() { [[ "${1:-}" =~ ^[a-zA-Z0-9._-]{1,32}$ ]] && id "${1:-}" >/dev/null 2>&1; }
+valid_bin()  {
+  local p="${1:-}"
+  [[ "$p" =~ ^/[a-zA-Z0-9./_-]+$ ]] || return 1
+  [[ "$p" != *".."* ]] || return 1
+  for pref in "${ALLOWED_BIN_PREFIXES[@]}"; do
+    [[ "$p" == "$pref"/* ]] && return 0
+  done
+  return 1
+}
+
+_create_user() {
+  # _create_user <user> <group> <real-name>
+  local u="$1" g="$2" rn="$3"
+  if id "$u" >/dev/null 2>&1; then return 0; fi
+  local next_uid new_uid next_gid new_gid
+  next_uid=$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)
+  new_uid=$(( next_uid + 1 ))
+  next_gid=$(dscl . -list /Groups PrimaryGroupID | awk '{print $2}' | sort -n | tail -1)
+  new_gid=$(( next_gid + 1 ))
+  dscl . -create "/Groups/$g" >/dev/null
+  dscl . -create "/Groups/$g" PrimaryGroupID "$new_gid" >/dev/null
+  dscl . -create "/Groups/$g" RealName "$rn" >/dev/null
+  dscl . -create "/Users/$u" >/dev/null
+  dscl . -create "/Users/$u" UserShell /bin/sh >/dev/null
+  dscl . -create "/Users/$u" RealName "$rn" >/dev/null
+  dscl . -create "/Users/$u" UniqueID "$new_uid" >/dev/null
+  dscl . -create "/Users/$u" PrimaryGroupID "$new_gid" >/dev/null
+  dscl . -create "/Users/$u" NFSHomeDirectory /var/empty >/dev/null
+  log "created user $u uid=$new_uid gid=$new_gid"
+}
+ensure_user()       { _create_user "$JAIL_USER"  "$JAIL_GROUP"  "KEYRING jailed processes"; }
+ensure_proxy_user() { _create_user "$PROXY_USER" "$PROXY_GROUP" "KEYRING egress proxy"; }
+
+write_anchor() {
+  local port="$1"
+  local jail_uid proxy_uid
+  jail_uid=$(id -u "$JAIL_USER")
+  proxy_uid=$(id -u "$PROXY_USER")
+  mkdir -p /etc/pf.anchors
+  cat > "$ANCHOR_FILE" <<EOF
+# KEYRING pf anchor — managed by keyring-helper. Do not edit.
+#
+# Two layers of enforcement:
+#
+# (1) Agent jail: the keyring-jail uid (used by 'keyring run' and by gated shims)
+#     can only egress to loopback:<proxy-port>. No DNS, no direct internet. An agent
+#     forced into this uid via the shim must talk to KEYRING — and only KEYRING.
+#
+# (2) Destination-level enforcement: every IP added to <keyring_gated_ips> is
+#     unreachable from ANY user EXCEPT keyring-proxy. So even processes running
+#     as the human (axiom) — including curl, python, MCP servers, the agent's
+#     direct fetch() calls — cannot reach a gated destination directly. The only
+#     route is via the KEYRING proxy (which runs as keyring-proxy).
+
+table <keyring_gated_ips> persist
+
+# --- (1) jail uid ---
+pass out quick proto tcp from any to 127.0.0.1 port $port user $jail_uid keep state
+pass out quick proto tcp from any to ::1       port $port user $jail_uid keep state
+block drop out quick proto tcp from any to any user $jail_uid
+block drop out quick proto udp from any to any user $jail_uid
+
+# --- (2) gated destinations (closes the "use curl/python/MCP to reach the same host" bypass) ---
+pass  out quick proto tcp from any to <keyring_gated_ips> user $proxy_uid keep state
+block drop out quick proto tcp from any to <keyring_gated_ips>
+EOF
+  cat > "$ANCHOR_CONF" <<EOF
+anchor "$ANCHOR_NAME"
+load anchor "$ANCHOR_NAME" from "$ANCHOR_FILE"
+EOF
+}
+
+# --- verbs ---
+verb="${1:-}"; shift || true
+case "$verb" in
+
+  jail-up)
+    port="${1:-}"
+    valid_port "$port" || j_err "bad_port"
+    ensure_user
+    ensure_proxy_user
+    write_anchor "$port"
+    if ! pfctl -f "$ANCHOR_CONF" >/dev/null 2>&1; then j_err "pfctl_load_failed"; fi
+    pfctl -E >/dev/null 2>&1 || true   # pf may already be enabled
+    log "jail-up port=$port"
+    j_ok "\"jail\":\"up\",\"port\":$port,\"jail_user\":\"$JAIL_USER\",\"proxy_user\":\"$PROXY_USER\""
+    ;;
+
+  proxy-start)
+    # proxy-start <task> <port> — spawn `node bin/keyring proxy` as keyring-proxy uid.
+    # The proxy is the ONLY process allowed to reach gated destination IPs by pf rule.
+    task="${1:-}"; port="${2:-}"
+    valid_name "$task" || j_err "bad_task"
+    valid_port "$port" || j_err "bad_port"
+    ensure_proxy_user
+    # Stop any prior proxy first (idempotent)
+    if [[ -f "$PROXY_PID_FILE" ]]; then
+      old=$(cat "$PROXY_PID_FILE" 2>/dev/null || echo)
+      if [[ -n "$old" ]] && kill -0 "$old" 2>/dev/null; then kill "$old" 2>/dev/null || true; sleep 0.3; fi
+    fi
+    # Use the bundled copy at /usr/local/lib/keyring — world-readable, no need to
+    # traverse the user's home directory (which macOS TCC protects from ACL grants).
+    bundle="/usr/local/lib/keyring"
+    [[ -d "$bundle" && -f "$bundle/bin/keyring" ]] || j_err "bundle_missing_run_bootstrap"
+    repo="$bundle"
+    # Find node. command -v in root's PATH may not include Homebrew; check the
+    # common locations explicitly as a fallback.
+    node_bin=$(command -v node 2>/dev/null || true)
+    if [[ ! -x "$node_bin" ]]; then
+      for cand in /opt/homebrew/bin/node /usr/local/bin/node /usr/bin/node; do
+        if [[ -x "$cand" ]]; then node_bin="$cand"; break; fi
+      done
+    fi
+    [[ -x "$node_bin" ]] || j_err "node_not_in_path"
+
+    # State lives in /var/lib/keyring/state.json (created by bootstrap, mode 666).
+    # Both axiom (CLI/dashboard) and keyring-proxy (this) can r/w it.
+    state_file="${KEYRING_STATE:-/var/lib/keyring/state.json}"
+    touch "$state_file" 2>/dev/null || true
+    chmod 666 "$state_file" 2>/dev/null || true
+    # Spawn as keyring-proxy uid, fully detached, stdio to log
+    touch "$PROXY_LOG_FILE" 2>/dev/null || true
+    chown "$PROXY_USER:$PROXY_GROUP" "$PROXY_LOG_FILE" 2>/dev/null || true
+    nohup sudo -u "$PROXY_USER" \
+      env KEYRING_PROXY_PORT="$port" KEYRING_TASK="$task" KEYRING_STATE="$state_file" \
+      "$node_bin" "$repo/bin/keyring" proxy --task "$task" --port "$port" \
+      >> "$PROXY_LOG_FILE" 2>&1 &
+    new_pid=$!
+    sleep 0.6
+    if ! kill -0 "$new_pid" 2>/dev/null; then j_err "proxy_died_immediately_check_log"; fi
+    echo "$new_pid" > "$PROXY_PID_FILE"
+    log "proxy-start pid=$new_pid task=$task port=$port"
+    j_ok "\"pid\":$new_pid,\"task\":\"$task\",\"port\":$port,\"running_as\":\"$PROXY_USER\""
+    ;;
+
+  proxy-stop)
+    if [[ ! -f "$PROXY_PID_FILE" ]]; then j_ok "\"running\":false"; fi
+    pid=$(cat "$PROXY_PID_FILE" 2>/dev/null || echo)
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      rm -f "$PROXY_PID_FILE"
+      log "proxy-stop pid=$pid"
+      j_ok "\"running\":true,\"killed_pid\":$pid"
+    else
+      rm -f "$PROXY_PID_FILE"
+      j_ok "\"running\":false,\"stale_pid_cleared\":true"
+    fi
+    ;;
+
+  proxy-status)
+    pid=""
+    if [[ -f "$PROXY_PID_FILE" ]]; then pid=$(cat "$PROXY_PID_FILE" 2>/dev/null || echo); fi
+    alive=false
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then alive=true; fi
+    j_ok "\"alive\":$alive,\"pid\":${pid:-null},\"user\":\"$PROXY_USER\""
+    ;;
+
+  add-host-block)
+    # add-host-block <hostname> — resolve A + AAAA, add to <keyring_gated_ips>.
+    host="${1:-}"
+    [[ "$host" =~ ^[a-zA-Z0-9.-]{1,253}$ ]] || j_err "bad_host"
+    # Resolve via dig if available, else nslookup as fallback.
+    ips=""
+    if command -v dig >/dev/null 2>&1; then
+      ips="$(dig +short +time=3 +tries=1 A "$host" 2>/dev/null) $(dig +short +time=3 +tries=1 AAAA "$host" 2>/dev/null)"
+    elif command -v host >/dev/null 2>&1; then
+      ips="$(host -W 3 -t A "$host" 2>/dev/null | awk '/has address/{print $NF}') $(host -W 3 -t AAAA "$host" 2>/dev/null | awk '/has IPv6 address/{print $NF}')"
+    fi
+    # Filter out anything that doesn't look like an IP (some dig outputs CNAMEs)
+    ip_count=0
+    ip_json=""
+    for ip in $ips; do
+      if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$ip" == *:* && "$ip" != *.* ]]; then
+        pfctl -a "$ANCHOR_NAME" -t keyring_gated_ips -T add "$ip" 2>/dev/null || true
+        [[ -n "$ip_json" ]] && ip_json+=","
+        ip_json+="\"$ip\""
+        ip_count=$((ip_count + 1))
+      fi
+    done
+    log "add-host-block host=$host ips=$ip_count"
+    j_ok "\"host\":\"$host\",\"ips\":[$ip_json],\"count\":$ip_count"
+    ;;
+
+  remove-host-block)
+    host="${1:-}"
+    [[ "$host" =~ ^[a-zA-Z0-9.-]{1,253}$ ]] || j_err "bad_host"
+    # We don't track which IPs came from which host (table is flat). For an honest
+    # remove, re-resolve the host and remove THOSE IPs. New IPs for other hosts stay.
+    ips=""
+    if command -v dig >/dev/null 2>&1; then
+      ips="$(dig +short +time=3 +tries=1 A "$host" 2>/dev/null) $(dig +short +time=3 +tries=1 AAAA "$host" 2>/dev/null)"
+    fi
+    removed=0
+    for ip in $ips; do
+      if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$ip" == *:* && "$ip" != *.* ]]; then
+        if pfctl -a "$ANCHOR_NAME" -t keyring_gated_ips -T delete "$ip" 2>/dev/null; then
+          removed=$((removed + 1))
+        fi
+      fi
+    done
+    log "remove-host-block host=$host removed=$removed"
+    j_ok "\"host\":\"$host\",\"removed\":$removed"
+    ;;
+
+  list-host-blocks)
+    out=$(pfctl -a "$ANCHOR_NAME" -t keyring_gated_ips -T show 2>/dev/null | awk '{gsub(/^[ \t]+/,"",$0); print "\""$0"\""}' | paste -sd, -)
+    j_ok "\"ips\":[${out:-}]"
+    ;;
+
+  flush-host-blocks)
+    pfctl -a "$ANCHOR_NAME" -t keyring_gated_ips -T flush 2>/dev/null || true
+    log "flush-host-blocks"
+    j_ok "\"flushed\":true"
+    ;;
+
+  jail-down)
+    pfctl -a "$ANCHOR_NAME" -F all >/dev/null 2>&1 || true
+    rm -f "$ANCHOR_FILE"
+    pfctl -f /etc/pf.conf >/dev/null 2>&1 || true
+    log "jail-down"
+    j_ok "\"jail\":\"down\""
+    ;;
+
+  jail-status)
+    local_user_present="false"
+    id "$JAIL_USER" >/dev/null 2>&1 && local_user_present="true"
+    anchor_present="false"
+    [[ -f "$ANCHOR_FILE" ]] && anchor_present="true"
+    rules=""
+    if pfctl -a "$ANCHOR_NAME" -s rules >/dev/null 2>&1; then
+      rules=$(pfctl -a "$ANCHOR_NAME" -s rules 2>/dev/null | wc -l | tr -d ' ')
+    fi
+    j_ok "\"jail_user\":$local_user_present,\"anchor\":$anchor_present,\"rule_count\":${rules:-0}"
+    ;;
+
+  shim-install)
+    cli="${1:-}"; bin="${2:-}"; port="${3:-}"; invoker="${4:-}"
+    valid_name "$cli"     || j_err "bad_cli_name"
+    valid_bin "$bin"      || j_err "bad_bin_path"
+    valid_port "$port"    || j_err "bad_port"
+    valid_user "$invoker" || j_err "bad_invoker_user"
+    real="${bin}.keyring-real"
+    sudoers="/etc/sudoers.d/keyring-shim-${cli}"
+    [[ -e "$bin" ]] || j_err "binary_not_found"
+    [[ -e "$real" ]] && j_err "already_shimmed"
+    id "$JAIL_USER" >/dev/null 2>&1 || j_err "jail_user_missing_run_install"
+
+    if head -1 "$bin" 2>/dev/null | grep -q "KEYRING shim"; then
+      j_err "binary_is_already_a_shim"
+    fi
+
+    mv "$bin" "$real" || j_err "move_failed"
+    # Stronger model: only keyring-jail can read/exec the real binary. axiom can't bypass
+    # the shim by calling .keyring-real directly because their uid lacks read+exec perms.
+    # The shim re-enters keyring-jail uid (via `keyring run`) to access it; auth-passthrough
+    # in `keyring run` snapshots the human's config dir into a temp HOME so the gated CLI
+    # still finds its token.
+    chown "$JAIL_USER:$JAIL_GROUP" "$real"
+    chmod 700 "$real"
+
+    cat > "$bin" <<EOF
+#!/bin/sh
+# KEYRING shim for $cli — routes every invocation through keyring-jail uid (with
+# config-snapshot auth pass-through) so direct calls to $real fail with EACCES.
+# Generated by keyring-helper.
+exec /usr/local/bin/keyring run -- "$real" "\$@"
+EOF
+    chown root:wheel "$bin"
+    chmod 755 "$bin"
+    # No per-shim sudoers entry needed — `keyring run` uses the helper's already-installed
+    # sudoers grant to drop to keyring-jail.
+    rm -f "$sudoers" 2>/dev/null || true
+    log "shim-install cli=$cli bin=$bin port=$port invoker=$invoker (strict mode)"
+    j_ok "\"cli\":\"$cli\",\"bin\":\"$bin\",\"real\":\"$real\",\"port\":$port,\"mode\":\"strict\""
+    ;;
+
+  shim-uninstall)
+    cli="${1:-}"; bin="${2:-}"
+    valid_name "$cli" || j_err "bad_cli_name"
+    valid_bin "$bin"  || j_err "bad_bin_path"
+    real="${bin}.keyring-real"
+    sudoers="/etc/sudoers.d/keyring-shim-${cli}"
+    if [[ -f "$bin" ]] && ! head -3 "$bin" 2>/dev/null | grep -q "KEYRING shim"; then
+      j_err "not_a_keyring_shim"
+    fi
+    [[ -e "$real" ]] || j_err "real_binary_missing"
+    rm -f "$bin"
+    mv "$real" "$bin" || j_err "restore_failed"
+    # Restore normal perms — strict-mode install chmod 700 keyring-jail; bring it back to
+    # the typical Homebrew shape so the user can run it directly again.
+    chown root:wheel "$bin" 2>/dev/null || true
+    chmod 755 "$bin"
+    rm -f "$sudoers"
+    log "shim-uninstall cli=$cli bin=$bin"
+    j_ok "\"cli\":\"$cli\",\"bin\":\"$bin\""
+    ;;
+
+  run)
+    # run <invoker> <config-paths-csv> <proxy-port> <abs-bin-path> [args...]
+    #
+    # Drops to the keyring-jail uid + sets HTTPS_PROXY + materializes a fresh HOME
+    # containing copies of the invoker's listed config dirs (so the gated CLI can find
+    # the human's auth). Cleans up the temp HOME on exit.
+    invoker="${1:-}"; shift || j_err "missing_invoker"
+    paths_csv="${1:-}"; shift || j_err "missing_paths"
+    port="${1:-}";     shift || j_err "missing_port"
+    bin="${1:-}";      shift || j_err "missing_bin"
+    valid_user "$invoker" || j_err "bad_invoker_user"
+    valid_port "$port"    || j_err "bad_port"
+    valid_bin  "$bin"     || j_err "bad_bin_path"
+    [[ -x "$bin" ]] || j_err "bin_not_executable"
+    id "$JAIL_USER" >/dev/null 2>&1 || j_err "jail_user_missing_run_install"
+
+    invoker_home=$(dscl . -read "/Users/$invoker" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+    [[ -n "$invoker_home" && -d "$invoker_home" ]] || j_err "invoker_home_not_found"
+
+    # sweep stale temp HOMEs left by past runs (older than 1h) — belt-and-suspenders cleanup
+    find /var/folders -maxdepth 1 -name 'keyring-run-*' -type d -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+
+    tmp_home=$(mktemp -d "/var/folders/keyring-run-XXXXXX")
+    chmod 750 "$tmp_home"
+    chown "$JAIL_USER:$JAIL_GROUP" "$tmp_home"
+    # cleanup on any exit path (success, error, signal)
+    cleanup_tmp_home() { rm -rf "$tmp_home" 2>/dev/null || true; }
+    trap cleanup_tmp_home EXIT INT TERM HUP
+
+    # Copy each requested config dir/file into the temp HOME with the same relative path.
+    # paths_csv is a comma-separated list of paths RELATIVE to invoker_home (e.g. ".railway,.config/gh").
+    if [[ -n "$paths_csv" ]]; then
+      IFS=',' read -ra REL_PATHS <<< "$paths_csv"
+      for rel in "${REL_PATHS[@]}"; do
+        rel="${rel## }"; rel="${rel%% }"
+        [[ -z "$rel" ]] && continue
+        # security: refuse traversal outside the invoker home
+        case "$rel" in
+          /*|*..*) j_err "bad_config_path" ;;
+        esac
+        src="$invoker_home/$rel"
+        dst="$tmp_home/$rel"
+        [[ -e "$src" ]] || continue                       # silently skip missing configs
+        mkdir -p "$(dirname "$dst")"
+        cp -R "$src" "$dst"
+        chown -R "$JAIL_USER:$JAIL_GROUP" "$dst"
+      done
+    fi
+
+    log "run invoker=$invoker bin=$bin paths=$paths_csv home=$tmp_home"
+    # Chdir to the temp HOME so the jailed child doesn't inherit a cwd it can't read
+    # (the invoker's project dir is typically mode 750 + ACL, not accessible to keyring-jail).
+    cd "$tmp_home" || j_err "cd_failed"
+    # Hand off to keyring-jail. Use env -i to ensure ONLY our chosen env reaches the child,
+    # then sudo into the jail uid (we're root so this needs no further sudoers rule).
+    sudo -u "$JAIL_USER" \
+      env -i \
+        HOME="$tmp_home" \
+        PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+        HTTPS_PROXY="http://127.0.0.1:$port" \
+        HTTP_PROXY="http://127.0.0.1:$port" \
+        NO_PROXY="localhost,127.0.0.1,::1" \
+        KEYRING_PROXIED=1 \
+        KEYRING_INVOKER="$invoker" \
+      "$bin" "$@"
+    rc=$?
+    cleanup_tmp_home
+    # Don't emit JSON here — stdio was used by the child. Just exit with the child's code.
+    exit $rc
+    ;;
+
+  self-uninstall)
+    # Tear down everything KEYRING installed at the system level. No state file touched.
+    pfctl -a "$ANCHOR_NAME" -F all >/dev/null 2>&1 || true
+    rm -f "$ANCHOR_FILE" "$ANCHOR_CONF"
+    pfctl -f /etc/pf.conf >/dev/null 2>&1 || true
+    # remove any leftover per-shim sudoers files (best-effort)
+    rm -f /etc/sudoers.d/keyring-shim-*
+    if id "$JAIL_USER" >/dev/null 2>&1; then
+      dscl . -delete "/Users/$JAIL_USER" 2>/dev/null || true
+    fi
+    if dscl . -read "/Groups/$JAIL_GROUP" >/dev/null 2>&1; then
+      dscl . -delete "/Groups/$JAIL_GROUP" 2>/dev/null || true
+    fi
+    rm -f "$SUDOERS_FILE"
+    # remove the PATH symlink only if it points to a KEYRING bin/keyring
+    if [[ -L /usr/local/bin/keyring ]]; then
+      tgt=$(readlink /usr/local/bin/keyring)
+      if [[ "$tgt" == */bin/keyring ]]; then
+        rm -f /usr/local/bin/keyring
+      fi
+    fi
+    log "self-uninstall complete"
+    # Remove the helper LAST so this script can finish first
+    ( sleep 1; rm -f "$HELPER_PATH"; rmdir /usr/local/libexec 2>/dev/null || true ) &
+    j_ok "\"uninstalled\":true"
+    ;;
+
+  *)
+    j_err "unknown_verb"
+    ;;
+esac

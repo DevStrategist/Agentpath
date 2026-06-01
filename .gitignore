@@ -1,0 +1,12 @@
+node_modules/
+.env
+.keyring-state.json
+.keyring-demo-state.json
+*.tmp
+
+# Session / tooling artifacts
+.remember/
+.playwright-mcp/
+
+# Loose screenshots (not referenced by docs; may contain captured workspace data)
+*.png

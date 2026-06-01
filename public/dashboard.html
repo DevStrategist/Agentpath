@@ -1,0 +1,313 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KEYRING — audit</title>
+<style>
+  :root{--bg:#0b0e14;--card:#141925;--line:#232a3a;--ink:#e6eaf2;--mut:#8a93a6;--ok:#1f9d57;--no:#d6455b;--acc:#5b8cff}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+  header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:12px}
+  h1{font:600 16px/1 system-ui;margin:0;letter-spacing:.5px} .sub{color:var(--mut);font:12px/1 system-ui}
+  main{padding:20px 24px;max-width:980px;margin:0 auto} .grid{display:grid;gap:18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .card h2{font:600 12px/1 system-ui;letter-spacing:1px;text-transform:uppercase;color:var(--mut);margin:0;padding:12px 16px;border-bottom:1px solid var(--line)}
+  table{width:100%;border-collapse:collapse} td,th{padding:9px 16px;text-align:left;border-bottom:1px solid var(--line)}
+  th{color:var(--mut);font:600 11px/1 system-ui;letter-spacing:.5px} tr:last-child td{border-bottom:0}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font:600 11px/1.6 system-ui}
+  .allowed{background:rgba(31,157,87,.16);color:#5fe39a} .denied{background:rgba(214,69,91,.16);color:#ff8a99}
+  .reason{color:var(--mut)} .host{color:var(--ink)} .by{color:var(--acc)}
+  .btn{cursor:pointer;border:1px solid var(--line);background:#1b2230;color:var(--ink);border-radius:7px;padding:5px 11px;font:600 12px/1 system-ui;margin-right:6px}
+  .btn.allow{border-color:#1f9d57;color:#5fe39a} .btn.deny{border-color:#d6455b;color:#ff8a99}
+  .empty{padding:16px;color:var(--mut)}
+</style></head><body>
+<header>
+  <h1>KEYRING</h1>
+  <span class="sub">policy egress proxy · live audit</span>
+  <span id="jailbadge" style="margin-left:auto" class="sub">jail: ?</span>
+</header>
+<main class="grid">
+  <div class="card" id="jail-card" style="display:none">
+    <h2>Privileged helper</h2>
+    <div id="jail-state" style="padding:12px 16px"></div>
+  </div>
+  <div class="card" id="proxy-card" style="display:none">
+    <h2>Egress proxy <span id="proxy-meta" class="sub" style="margin-left:8px;font-weight:normal"></span></h2>
+    <div id="proxy-state" style="padding:12px 16px"></div>
+  </div>
+  <div class="card">
+    <h2>Discovered CLIs <span id="disc-meta" class="sub" style="margin-left:8px;font-weight:normal"></span></h2>
+    <div style="padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input id="d-filter" placeholder="filter…" style="background:#0b0e14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:6px 10px;font:13px ui-monospace,monospace;flex:1;min-width:120px" oninput="renderDiscovered()"/>
+      <label class="sub" style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
+        <input id="d-onlygated" type="checkbox" oninput="renderDiscovered()"/> only enabled
+      </label>
+    </div>
+    <div id="discovered" style="max-height:340px;overflow:auto"><div class="empty">scanning…</div></div>
+  </div>
+  <div class="card">
+    <h2>Manually registered gates</h2>
+    <div id="gates"><div class="empty">none</div></div>
+    <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <input id="g-name" placeholder="cli name (e.g. railway)" style="background:#0b0e14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:6px 10px;font:13px ui-monospace,monospace;flex:1;min-width:120px"/>
+      <input id="g-bin" placeholder="optional --bin path" style="background:#0b0e14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:6px 10px;font:13px ui-monospace,monospace;flex:2;min-width:160px"/>
+      <button class="btn allow" onclick="addGate()">Register</button>
+    </div>
+  </div>
+  <div class="card"><h2>Pending approvals</h2><div id="pending"><div class="empty">none</div></div></div>
+  <div class="card"><h2>Audit trail</h2><table><thead><tr><th>time</th><th>cli</th><th>host</th><th>decision</th><th>reason</th><th>approver</th></tr></thead><tbody id="audit"></tbody></table></div>
+</main>
+<script>
+async function j(u,o){const r=await fetch(u,o);return r.json()}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+let discoveredCache = { items: [], host: '', count: 0, gatedCount: 0 };
+let recentlyToggled = new Map(); // name -> timestamp, used to flash the row briefly
+function renderDiscovered(){
+  const filter = (document.getElementById('d-filter').value || '').trim().toLowerCase();
+  const onlyGated = document.getElementById('d-onlygated').checked;
+  const items = discoveredCache.items
+    .filter(i =>
+      (!filter || i.name.toLowerCase().includes(filter) || (i.path||'').toLowerCase().includes(filter)) &&
+      (!onlyGated || i.gated))
+    .sort((a, b) => (b.gated - a.gated) || a.name.localeCompare(b.name)); // gated to the top
+
+  document.getElementById('disc-meta').textContent =
+    `${discoveredCache.gatedCount} of ${discoveredCache.count} enabled · scanned on ${discoveredCache.host}`;
+
+  const now = Date.now();
+  document.getElementById('discovered').innerHTML = items.length ? items.map(i => {
+    const flashUntil = recentlyToggled.get(i.name) || 0;
+    const flashing = flashUntil > now;
+    const bg = flashing ? 'background:rgba(31,157,87,.18);transition:background .8s' : '';
+    return `<div data-cli="${esc(i.name)}" style="padding:8px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px;${bg}">
+      <div style="flex:1;min-width:0;overflow:hidden">
+        <div style="display:flex;gap:10px;align-items:center">
+          <span class="host" style="font-weight:600">${esc(i.name)}</span>
+          ${i.gated ? `<span class="pill ${i.enforcement==='shimmed'?'allowed':'denied'}" style="font-size:10px">${esc(i.enforcement||'on')}</span>` : ''}
+        </div>
+        <div class="reason" style="font-size:11px;margin-top:2px;text-overflow:ellipsis;overflow:hidden;white-space:nowrap">${esc(i.path)}</div>
+      </div>
+      ${i.gated
+        ? `<button class="btn deny" data-act="disable" data-name="${esc(i.name)}">Disable</button>`
+        : `<button class="btn allow" data-act="enable" data-name="${esc(i.name)}" data-path="${esc(i.path)}">Enable</button>`}
+    </div>`;
+  }).join('') : '<div class="empty">no matches</div>';
+}
+// Event delegation — keeps the inline onclick attrs out of the picture (which broke quietly
+// when paths contained unusual characters or when the HTML was cached stale).
+document.addEventListener('click', async (ev) => {
+  // Proxy lifecycle + block-refresh
+  if (ev.target.id === 'btn-refresh-blocks') {
+    ev.target.disabled = true; ev.target.innerText = 'Refreshing…';
+    const r = await fetch('/api/proxy/refresh-blocks', { method: 'POST' });
+    const j2 = await r.json().catch(()=>({}));
+    if (r.ok) { lastBlockRefresh = Date.now(); banner(`✓ refreshed ${j2.refreshed} host(s); ${(j2.hosts||[]).flatMap(h=>h.ips||[]).length} IPs in block table`, 'ok'); }
+    else banner(`refresh failed: ${j2.error||r.status}`, 'err');
+    tick(); return;
+  }
+  if (ev.target.id === 'btn-proxy-start') {
+    ev.target.disabled = true; ev.target.innerText = 'Starting…';
+    const r = await fetch('/api/proxy/start', { method: 'POST' });
+    const j2 = await r.json().catch(()=>({}));
+    if (r.ok) { lastBlockRefresh = Date.now(); banner(`✓ proxy started · pid ${j2.pid} · running as ${j2.runningAs}`, 'ok'); }
+    else banner(`proxy start failed: ${j2.error||r.status}`, 'err');
+    tick(); return;
+  }
+  if (ev.target.id === 'btn-proxy-stop') {
+    if (!confirm('Stop the egress proxy? All gated CLIs will fail with Connection refused until restarted.')) return;
+    ev.target.disabled = true; ev.target.innerText = 'Stopping…';
+    const r = await fetch('/api/proxy/stop', { method: 'POST' });
+    const j2 = await r.json().catch(()=>({}));
+    if (r.ok) banner(`proxy stopped${j2.killed_pid?` (pid ${j2.killed_pid})`:''}`, 'warn');
+    else banner(`stop failed: ${j2.error||r.status}`, 'err');
+    tick(); return;
+  }
+
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  const name = btn.dataset.name;
+  const path = btn.dataset.path;
+  btn.disabled = true;
+  const orig = btn.innerText;
+  btn.innerText = act === 'enable' ? 'Enabling…' : 'Disabling…';
+  try {
+    if (act === 'enable') {
+      // 1. register the gate (metadata only; cheap, always works)
+      const r1 = await fetch('/api/gates', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ name, binPath: path }) });
+      if (!r1.ok) {
+        const e = await r1.json().catch(()=>({error:'failed'}));
+        throw new Error(e.error || r1.status);
+      }
+      // 2. install the shim — THIS is the actual block. If the helper isn't installed
+      // the call returns not_installed and we surface that clearly.
+      btn.innerText = 'Installing shim…';
+      const r2 = await fetch('/api/gates/' + encodeURIComponent(name) + '/install', { method: 'POST' });
+      if (!r2.ok) {
+        const e = await r2.json().catch(()=>({error:'failed'}));
+        if (e.error === 'not_installed') {
+          banner(`registered "${name}" — but the KEYRING helper isn't installed, so the binary is NOT actually blocked. Run: sudo keyring install`, 'warn');
+        } else {
+          banner(`shim install failed for "${name}": ${e.error}. Registered only — binary NOT blocked.`, 'warn');
+        }
+      } else {
+        banner(`✓ ${name} gated. /opt/homebrew/bin/${name} now routes through KEYRING. Any process invoking ${name} (you or any agent) hits the shim.`, 'ok');
+      }
+    } else {
+      // disable: uninstall shim first (idempotent), then unregister
+      btn.innerText = 'Uninstalling shim…';
+      await fetch('/api/gates/' + encodeURIComponent(name) + '/uninstall', { method: 'POST' });
+      const r = await fetch('/api/gates/' + encodeURIComponent(name), { method: 'DELETE' });
+      if (!r.ok) {
+        const e = await r.json().catch(()=>({error:'failed'}));
+        throw new Error(e.error || r.status);
+      }
+      banner(`✓ ${name} ungated. Binary restored.`, 'ok');
+    }
+    recentlyToggled.set(name, Date.now() + 1500);
+    await tick();
+  } catch (err) {
+    btn.innerText = String(err.message || err).slice(0, 60);
+    btn.style.color = '#ff8a99';
+    setTimeout(() => { btn.disabled = false; btn.innerText = orig; btn.style.color = ''; }, 4000);
+  }
+});
+function banner(msg, kind) {
+  let el = document.getElementById('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    el.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);padding:10px 16px;border-radius:8px;font:13px ui-monospace,monospace;z-index:1000;max-width:760px;box-shadow:0 6px 20px rgba(0,0,0,.4)';
+    document.body.appendChild(el);
+  }
+  el.style.background = kind === 'ok' ? 'rgba(31,157,87,.95)' : (kind === 'warn' ? 'rgba(214,140,69,.95)' : 'rgba(214,69,91,.95)');
+  el.style.color = '#fff';
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(window.__toastT);
+  window.__toastT = setTimeout(() => { el.style.display = 'none'; }, 6000);
+}
+let lastBlockRefresh = null;
+async function tick(){
+  try{
+    discoveredCache = await j('/api/discovered-clis');
+    renderDiscovered();
+    // proxy health card
+    const px = await j('/api/proxy/health');
+    const pcard = document.getElementById('proxy-card');
+    const pstate = document.getElementById('proxy-state');
+    const pmeta = document.getElementById('proxy-meta');
+    pcard.style.display = 'block';
+    const running = !!px.pid && px.listening;
+    pmeta.textContent = running
+      ? `pid ${px.pid} · ${px.blockedIpCount} IPs blocked · ${px.shimsExist ? 'shims active' : 'no shims'}`
+      : (px.shimsExist ? 'DOWN — gated CLIs are failing closed' : 'down');
+    pmeta.style.color = running ? '#5fe39a' : (px.shimsExist ? '#ff8a99' : '#8a93a6');
+    const stateLine = running
+      ? `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+           <div>
+             <span class="pill allowed">UP</span>
+             <span class="reason" style="margin-left:10px">port ${px.port} · uid <code style="color:var(--ink)">${esc(px.proxyUser)}</code></span>
+             <span class="reason" style="margin-left:10px">${px.blockedIpCount} IPs in kernel block table</span>
+             ${lastBlockRefresh ? `<span class="reason" style="margin-left:10px">refreshed ${Math.round((Date.now()-lastBlockRefresh)/1000)}s ago</span>` : ''}
+           </div>
+           <div>
+             <button class="btn" id="btn-refresh-blocks">Refresh IP blocks</button>
+             <button class="btn deny" id="btn-proxy-stop">Stop proxy</button>
+           </div>
+         </div>
+         ${px.blockedIps && px.blockedIps.length
+           ? `<details style="margin-top:10px"><summary class="reason" style="cursor:pointer">show ${px.blockedIps.length} blocked IPs</summary>
+              <div style="margin-top:6px;font-size:11px;color:var(--ink);font-family:ui-monospace,monospace">${px.blockedIps.map(esc).join(', ')}</div></details>`
+           : ''}`
+      : `<div>
+           <div style="color:${px.shimsExist ? '#ff8a99' : 'var(--mut)'};font-weight:${px.shimsExist ? '600' : 'normal'}">
+             ${px.shimsExist
+               ? '⚠️ Proxy is DOWN but shims are installed. Every gated CLI call is failing with Connection refused. Start the proxy now:'
+               : 'Proxy is not running. Start it when you enable your first gate.'}
+           </div>
+           <button class="btn allow" id="btn-proxy-start" style="margin-top:10px">Start proxy</button>
+         </div>`;
+    pstate.innerHTML = stateLine;
+    const jail=await j('/api/jail');
+    const badge=document.getElementById('jailbadge');
+    const card=document.getElementById('jail-card');
+    const state=document.getElementById('jail-state');
+    if (!jail.installed) {
+      badge.textContent = 'helper: NOT installed';
+      badge.style.color = '#ff8a99';
+      card.style.display = 'block';
+      state.innerHTML = `<div style="color:#ff8a99;font-weight:600">helper not installed</div>
+        <div class="reason" style="margin-top:6px">in your terminal, run once:</div>
+        <pre style="background:#0b0e14;padding:10px;border-radius:6px;margin-top:6px;overflow:auto"><code>sudo keyring install</code></pre>
+        <div class="reason" style="margin-top:6px">after that, everything below works without password prompts.</div>`;
+    } else {
+      const up = jail.rule_count > 0;
+      badge.textContent = up ? `jail: UP · ${jail.rule_count} rules` : 'jail: DOWN';
+      badge.style.color = up ? '#5fe39a' : '#8a93a6';
+      card.style.display = 'block';
+      state.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+        <div>
+          <span class="pill ${up?'allowed':'denied'}">${up?'UP':'DOWN'}</span>
+          <span class="reason" style="margin-left:10px">user: ${jail.jail_user?'keyring-jail ✓':'missing ✗'}</span>
+          <span class="reason" style="margin-left:10px">anchor: ${jail.anchor?'loaded':'(empty)'}</span>
+        </div>
+        <div>
+          ${up
+            ? '<button class="btn deny" onclick="jailDown()">Bring jail down</button>'
+            : '<button class="btn allow" onclick="jailUp()">Bring jail up</button>'}
+        </div>
+      </div>`;
+    }
+
+    const gates=await j('/api/gates');
+    document.getElementById('gates').innerHTML = gates.length ? gates.map(g=>{
+      const cfg = (g.configPaths && g.configPaths.length) ? g.configPaths.join(', ') : '(no auth pass-through configured)';
+      return `<div style="padding:10px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:start;gap:12px">
+        <div style="flex:1;min-width:0">
+          <div><span class="host">${esc(g.name)}</span>
+            <span class="reason" style="margin-left:10px">${esc(g.binPath||'(no path)')}</span>
+          </div>
+          <div class="reason" style="margin-top:4px;font-size:12px">auth pass-through: ${esc(cfg)}</div>
+          <div class="reason" style="margin-top:4px;font-size:12px">invoke as agent: <code style="color:var(--ink)">keyring run -- ${esc(g.name)} &lt;args&gt;</code></div>
+        </div>
+        <div><button class="btn" onclick="rmGate('${esc(g.name)}')">Unregister</button></div>
+      </div>`;
+    }).join('') : '<div class="empty">no CLIs gated yet — register one below</div>';
+
+    const pend=await j('/api/pending');
+    document.getElementById('pending').innerHTML = pend.length ? pend.map(p=>
+      `<div style="padding:12px 16px;border-bottom:1px solid var(--line)">Allow agent to reach <span class="host">${esc(p.host)}</span> for task <b>${esc(p.taskId)}</b>?
+       <div style="margin-top:8px"><button class="btn allow" onclick="act('${p.id}','approve')">Allow</button><button class="btn deny" onclick="act('${p.id}','deny')">Deny</button></div></div>`
+    ).join('') : '<div class="empty">none</div>';
+    const a=await j('/api/audit'); a.reverse();
+    document.getElementById('audit').innerHTML = a.map(e=>{
+      const cls = e.decision==='allowed' ? 'allowed' : (e.decision==='invoked' ? '' : 'denied');
+      const t=new Date(e.ts).toLocaleTimeString();
+      return `<tr><td class="reason">${t}</td><td class="by">${esc(e.cli||'')}</td><td class="host">${esc(e.host||'')}</td><td>${cls?`<span class="pill ${cls}">${esc(e.decision)}</span>`:`<span class="reason">${esc(e.decision)}</span>`}</td><td class="reason">${esc(e.reason)}</td><td class="by">${esc(e.approver||'')}</td></tr>`;
+    }).join('') || '<tr><td colspan="6" class="empty">no events yet</td></tr>';
+  }catch(e){}
+}
+async function act(id,kind){ await fetch('/api/'+kind,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); tick(); }
+async function addGate(){
+  const name=document.getElementById('g-name').value.trim();
+  const binPath=document.getElementById('g-bin').value.trim();
+  if(!name){return}
+  const r=await fetch('/api/gates',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,binPath:binPath||null})});
+  if(!r.ok){const e=await r.json().catch(()=>({error:'failed'}));alert('error: '+(e.error||r.status))}
+  document.getElementById('g-name').value=''; document.getElementById('g-bin').value=''; tick();
+}
+async function rmGate(name){
+  const r=await fetch('/api/gates/'+encodeURIComponent(name),{method:'DELETE'});
+  if(!r.ok){const e=await r.json().catch(()=>({error:'failed'}));alert('error: '+(e.error||r.status)+(e.hint?'\n'+e.hint:''))}
+  tick();
+}
+async function jailUp(){
+  const r=await fetch('/api/jail/up',{method:'POST'});
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('jail up failed: '+(e.error||r.status))}
+  tick();
+}
+async function jailDown(){
+  if(!confirm('bring jail down? gated CLIs become bypassable.'))return;
+  const r=await fetch('/api/jail/down',{method:'POST'});
+  if(!r.ok){const e=await r.json().catch(()=>({}));alert('jail down failed: '+(e.error||r.status))}
+  tick();
+}
+tick(); setInterval(tick,1500);
+</script></body></html>

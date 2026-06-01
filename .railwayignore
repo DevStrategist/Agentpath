@@ -1,0 +1,10 @@
+.env
+.env.*
+.keyring-state.json
+.keyring-demo-state.json
+.remember/
+.playwright-mcp/
+node_modules/
+*.png
+*.tmp
+/tmp/
