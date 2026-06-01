@@ -18,6 +18,7 @@ function load() {
 }
 function save(s) {
   const tmp = STATE + '.tmp';
+  fs.mkdirSync(path.dirname(STATE), { recursive: true });
   fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
   fs.renameSync(tmp, STATE);
 }

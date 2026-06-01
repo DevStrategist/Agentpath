@@ -1,5 +1,7 @@
 // Minimal assertions for the moat: attenuation + task-binding + scope.
-process.env.KEYRING_STATE = '/tmp/keyring-test-' + Date.now() + '.json';
+const os = require('os');
+const path = require('path');
+process.env.KEYRING_STATE = path.join(os.tmpdir(), 'keyring-test-' + Date.now() + '.json');
 const core = require('../src/core');
 let pass = 0, fail = 0;
 const ok = (name, cond) => { if (cond) { pass++; console.log('  PASS', name); } else { fail++; console.log('  FAIL', name); } };
