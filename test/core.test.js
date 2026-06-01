@@ -137,6 +137,9 @@ ok('env parser strips matching quotes', (() => {
   return parsed.KEYRING_DASHBOARD_URL === 'https://example.com' &&
     parsed.SLACK_SIGNING_SECRET === 'abc';
 })());
+ok('env path resolution tolerates inaccessible cwd', (() => {
+  return env.defaultDotEnvPath(() => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); }) === null;
+})());
 
 setTimeout(() => {
   ok('task expires by ttl', core.getTask('t2').status === 'expired');

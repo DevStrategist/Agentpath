@@ -19,7 +19,18 @@ function parseDotEnv(text) {
   return out;
 }
 
-function loadDotEnv(file = path.join(process.cwd(), '.env'), target = process.env) {
+function defaultDotEnvPath(cwd = process.cwd) {
+  try {
+    return path.join(cwd(), '.env');
+  } catch (e) {
+    return null;
+  }
+}
+
+function loadDotEnv(file, target = process.env) {
+  const resolved = file || defaultDotEnvPath();
+  if (!resolved) return {};
+  file = resolved;
   if (!fs.existsSync(file)) return {};
   const parsed = parseDotEnv(fs.readFileSync(file, 'utf8'));
   for (const [key, value] of Object.entries(parsed)) {
@@ -28,4 +39,4 @@ function loadDotEnv(file = path.join(process.cwd(), '.env'), target = process.en
   return parsed;
 }
 
-module.exports = { parseDotEnv, loadDotEnv };
+module.exports = { parseDotEnv, loadDotEnv, defaultDotEnvPath };
