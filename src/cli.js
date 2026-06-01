@@ -141,8 +141,12 @@ switch (cmd) {
     } else if (sub === 'mode') {
       if (!flags.enforcement || !['real', 'simulated'].includes(flags.enforcement)) die('usage: keyring access mode --cli railway --enforcement real|simulated');
       ok(core.setAccessRule(cli, { enforcement: flags.enforcement, by: flags.by || process.env.USER || 'cli', source: 'cli' }));
+    } else if (sub === 'proxy') {
+      const proxy = flags.proxy || flags.state;
+      if (!proxy || !['requires_approval', 'allowed', 'denied'].includes(proxy)) die('usage: keyring access proxy --cli railway --proxy requires_approval|allowed|denied');
+      ok(core.setAccessRule(cli, { proxy, by: flags.by || process.env.USER || 'cli', source: 'cli' }));
     } else {
-      die('usage: keyring access show|list|block|unblock|mode --cli <name>');
+      die('usage: keyring access show|list|block|unblock|mode|proxy --cli <name>');
     }
     break;
   }
@@ -288,6 +292,7 @@ switch (cmd) {
       '  access block --cli railway             block direct CLI egress',
       '  access unblock --cli railway           unblock direct CLI egress',
       '  access mode --cli railway --enforcement real|simulated',
+      '  access proxy --cli railway --proxy requires_approval|allowed|denied',
       '',
       'gated CLIs (per-binary universal mode — silent after install):',
       '  gate add --name <cli> [--bin <path>]  register a CLI to gate (no system change)',

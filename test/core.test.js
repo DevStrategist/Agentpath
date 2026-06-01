@@ -93,6 +93,19 @@ ok('blocked access rule is visible to proxy checks', (() => {
   const rule = core.getAccessRule('railway');
   return rule.direct === 'blocked' && rule.proxy === 'requires_approval';
 })());
+ok('proxy access can be denied and audited', (() => {
+  const before = core.getAudit().length;
+  const rule = core.setAccessRule('railway', { proxy: 'denied', by: 'unit', source: 'test' });
+  const audit = core.getAudit().slice(before);
+  return rule.proxy === 'denied' &&
+    audit.some(e => e.reason === 'proxy_access_denied' && e.cli === 'railway' && e.decision === 'denied');
+})());
+ok('proxy access can be returned to approval mode', (() => {
+  const rule = core.setAccessRule('railway', { proxy: 'requires_approval', by: 'unit', source: 'test' });
+  const latest = core.getAudit().slice(-1)[0];
+  return rule.proxy === 'requires_approval' &&
+    latest.reason === 'proxy_access_requires_approval';
+})());
 
 setTimeout(() => {
   ok('task expires by ttl', core.getTask('t2').status === 'expired');

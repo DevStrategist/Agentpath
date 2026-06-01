@@ -119,6 +119,17 @@ const server = http.createServer(async (req, res) => {
     });
     return send(res, 200, rule);
   }
+  if (req.method === 'POST' && u.pathname.match(/^\/api\/access-rules\/[^/]+\/proxy$/)) {
+    const name = decodeURIComponent(u.pathname.split('/')[3]);
+    const body = JSON.parse((await readBody(req)) || '{}');
+    if (!['requires_approval', 'allowed', 'denied'].includes(body.proxy)) return send(res, 400, { error: 'invalid_proxy_access_state' });
+    const rule = core.setAccessRule(name, {
+      proxy: body.proxy,
+      by: body.by || 'dashboard',
+      source: body.source || 'dashboard'
+    });
+    return send(res, 200, rule);
+  }
   if (req.method === 'POST' && u.pathname.match(/^\/api\/access-rules\/[^/]+\/notify$/)) {
     const name = decodeURIComponent(u.pathname.split('/')[3]);
     const rule = core.getAccessRule(name) || core.ensureAccessRule(name);

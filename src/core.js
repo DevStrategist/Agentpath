@@ -209,6 +209,19 @@ function setAccessRule(cli, patch = {}) {
       });
       if (s.audit.length > 500) s.audit = s.audit.slice(-500);
     }
+    if (patch.proxy && patch.proxy !== prev.proxy) {
+      s.audit.push({
+        ts: Date.now(),
+        taskId: patch.taskId || null,
+        host: null,
+        cli,
+        decision: patch.proxy === 'denied' ? 'denied' : 'allowed',
+        reason: patch.proxy === 'denied' ? 'proxy_access_denied' : `proxy_access_${patch.proxy}`,
+        approver: patch.by || 'unknown',
+        source: patch.source || 'unknown'
+      });
+      if (s.audit.length > 500) s.audit = s.audit.slice(-500);
+    }
     return next;
   });
 }

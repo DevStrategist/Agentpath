@@ -143,6 +143,19 @@ document.addEventListener('click', async (ev) => {
     else banner(`Slack notify failed: ${j2.error||r.status}`, 'err');
     tick(); return;
   }
+  if (ev.target.id === 'btn-proxy-deny' || ev.target.id === 'btn-proxy-require') {
+    const proxy = ev.target.id === 'btn-proxy-deny' ? 'denied' : 'requires_approval';
+    ev.target.disabled = true;
+    const r = await fetch('/api/access-rules/railway/proxy', {
+      method: 'POST',
+      headers: {'content-type':'application/json'},
+      body: JSON.stringify({ proxy, by: 'dashboard', source: 'dashboard' })
+    });
+    const j2 = await r.json().catch(()=>({}));
+    if (r.ok) banner(`KEYRING railway proxy is ${j2.proxy}`, j2.proxy === 'denied' ? 'warn' : 'ok');
+    else banner(`proxy access update failed: ${j2.error||r.status}`, 'err');
+    tick(); return;
+  }
 
   const btn = ev.target.closest('button[data-act]');
   if (!btn) return;
@@ -256,24 +269,30 @@ async function tick(){
     const ameta = document.getElementById('access-meta');
     acard.style.display = 'block';
     const blocked = ar.direct === 'blocked';
+    const proxyDenied = ar.proxy === 'denied';
     ameta.textContent = `${ar.direct} · ${ar.enforcement} enforcement · proxy ${ar.proxy}`;
-    ameta.style.color = blocked ? '#5fe39a' : '#ff8a99';
+    ameta.style.color = (blocked && !proxyDenied) ? '#5fe39a' : '#ff8a99';
     astate.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
       <div>
         <span class="pill ${blocked?'allowed':'denied'}">${blocked?'DIRECT BLOCKED':'DIRECT UNBLOCKED'}</span>
+        <span class="pill ${proxyDenied?'denied':'allowed'}" style="margin-left:6px">${proxyDenied?'KEYRING PROXY BLOCKED':'KEYRING PROXY REQUIRES APPROVAL'}</span>
         <span class="reason" style="margin-left:10px">agent route: KEYRING proxy</span>
         <span class="reason" style="margin-left:10px">changed by ${esc(ar.lastChangedBy||'system')}</span>
       </div>
       <div>
         <button class="btn allow" id="btn-access-block" ${blocked?'disabled':''}>Block direct Railway</button>
         <button class="btn deny" id="btn-access-unblock" ${blocked?'':'disabled'}>Unblock direct Railway</button>
+        <button class="btn deny" id="btn-proxy-deny" ${proxyDenied?'disabled':''}>Block KEYRING Railway</button>
+        <button class="btn allow" id="btn-proxy-require" ${proxyDenied?'':'disabled'}>Require approval</button>
         <button class="btn" id="btn-access-notify">Notify Slack</button>
       </div>
     </div>
     <div class="reason" style="margin-top:8px">
-      ${blocked
-        ? 'Direct railway egress is blocked; approved operations must go through KEYRING.'
-        : 'Direct railway egress is unblocked. Block it before running the protected demo path.'}
+      ${proxyDenied
+        ? 'KEYRING will deny Railway proxy requests. Use this to show the agent cannot use Railway even through KEYRING.'
+        : (blocked
+          ? 'Direct railway egress is blocked; Railway operations must go through KEYRING approval.'
+          : 'Direct railway egress is unblocked. Block it before running the protected demo path.')}
     </div>`;
     const jail=await j('/api/jail');
     const badge=document.getElementById('jailbadge');
