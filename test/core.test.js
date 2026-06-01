@@ -2,6 +2,7 @@
 process.env.KEYRING_STATE = '/tmp/keyring-test-' + Date.now() + '.json';
 const core = require('../src/core');
 const slack = require('../src/slack');
+const invoker = require('../src/invoker');
 let pass = 0, fail = 0;
 const ok = (name, cond) => { if (cond) { pass++; console.log('  PASS', name); } else { fail++; console.log('  FAIL', name); } };
 
@@ -105,6 +106,16 @@ ok('proxy access can be returned to approval mode', (() => {
   const latest = core.getAudit().slice(-1)[0];
   return rule.proxy === 'requires_approval' &&
     latest.reason === 'proxy_access_requires_approval';
+})());
+ok('install wrapper resolves invoking user when sudo env is missing', (() => {
+  const user = invoker.resolveInvokingUser({ USER: 'root', LOGNAME: 'root' }, () => 'axiom');
+  return user === 'axiom';
+})());
+ok('install wrapper skips nested sudo when already root', (() => {
+  const invocation = invoker.bootstrapInvocation('/tmp/bootstrap.sh', 'axiom', true);
+  return invocation.cmd === 'bash' &&
+    invocation.args[0] === '/tmp/bootstrap.sh' &&
+    invocation.env.SUDO_USER === 'axiom';
 })());
 
 setTimeout(() => {

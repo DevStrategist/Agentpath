@@ -4,6 +4,7 @@ const ap = require('./approver');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
+const { resolveInvokingUser, bootstrapInvocation } = require('./invoker');
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -256,8 +257,11 @@ switch (cmd) {
     // One-time bootstrap. The user must type their password ONCE; after that
     // keyring uses the installed helper non-interactively for all privileged ops.
     const script = path.join(jailDir, 'bootstrap.sh');
+    const invoker = resolveInvokingUser();
+    if (!invoker) die('could not determine invoking user. Try: sudo SUDO_USER=$USER keyring install');
     console.error(`installing KEYRING privileged helper. you will be prompted for your password once.`);
-    const r = spawnSync('sudo', ['bash', script], { stdio: 'inherit' });
+    const invocation = bootstrapInvocation(script, invoker, typeof process.getuid === 'function' && process.getuid() === 0);
+    const r = spawnSync(invocation.cmd, invocation.args, { stdio: 'inherit', env: invocation.env || process.env });
     process.exit(r.status === null ? 1 : r.status);
   }
   case 'uninstall': {
