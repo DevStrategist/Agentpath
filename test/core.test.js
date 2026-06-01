@@ -1,5 +1,7 @@
 // Minimal assertions for the moat: attenuation + task-binding + scope.
 process.env.KEYRING_STATE = '/tmp/keyring-test-' + Date.now() + '.json';
+const fs = require('fs');
+const path = require('path');
 const core = require('../src/core');
 const slack = require('../src/slack');
 const invoker = require('../src/invoker');
@@ -90,6 +92,41 @@ ok('slack access blocks include block and unblock actions', (() => {
   const actions = blocks.flatMap(b => b.elements || []).map(e => e.action_id).filter(Boolean);
   return actions.includes('access_block') && actions.includes('access_unblock');
 })());
+ok('slack access blocks explain approval prompt choices in require mode', (() => {
+  const blocks = slack.accessRuleBlocks(
+    { cli: 'railway', direct: 'blocked', proxy: 'requires_approval', enforcement: 'real' },
+    { dashboardUrl: 'https://keyring.example' }
+  );
+  const body = JSON.stringify(blocks);
+  return body.includes('Next Railway proxy use will ask') &&
+    body.includes('Allow for 10 mins') &&
+    body.includes('Allow forever') &&
+    body.includes('Deny');
+})());
+ok('slack access blocks include signed proxy control links', (() => {
+  const blocks = slack.accessRuleBlocks(
+    { cli: 'railway', direct: 'blocked', proxy: 'requires_approval', enforcement: 'real' },
+    { dashboardUrl: 'https://keyring.example' }
+  );
+  const body = JSON.stringify(blocks);
+  return body.includes('/api/slack/decision') &&
+    body.includes('Require approval') &&
+    body.includes('Block KEYRING Railway') &&
+    body.includes('Allow forever');
+})());
+ok('slack proxy control links carry the current rule version', (() => {
+  const blocks = slack.accessRuleBlocks(
+    { cli: 'railway', direct: 'blocked', proxy: 'requires_approval', enforcement: 'real', updatedAt: 12345 },
+    { dashboardUrl: 'https://keyring.example' }
+  );
+  return JSON.stringify(blocks).includes('version=12345');
+})());
+ok('slack decision tokens verify only for the signed rule version', (() => {
+  const token = slack.signDecision('railway', 'allow_forever', '12345');
+  return slack.verifyDecisionToken('railway', 'allow_forever', token, '12345') &&
+    !slack.verifyDecisionToken('railway', 'allow_forever', token, '67890') &&
+    !slack.verifyDecisionToken('railway', 'allow_forever', token);
+})());
 ok('blocked access rule is visible to proxy checks', (() => {
   core.setAccessRule('railway', { direct: 'blocked', by: 'unit', source: 'test' });
   const rule = core.getAccessRule('railway');
@@ -108,13 +145,71 @@ ok('proxy access can be returned to approval mode', (() => {
   return rule.proxy === 'requires_approval' &&
     latest.reason === 'proxy_access_requires_approval';
 })());
-ok('railway proxy approval mode requires fresh approval instead of cache', (() => {
-  const rule = core.setAccessRule('railway', { proxy: 'requires_approval', by: 'unit', source: 'test' });
-  return core.requiresFreshProxyApproval(rule);
+ok('temporary proxy grant is active until expiry', (() => {
+  const rule = core.grantProxyAccess('railway', { durationMs: 600000, by: 'slack-user', source: 'unit' });
+  return rule.proxy === 'allowed' &&
+    rule.proxyGrant.exp > Date.now() &&
+    core.proxyGrantActive(rule);
 })());
-ok('non-railway rules can still use cached host approvals', (() => {
-  const rule = core.setAccessRule('gh', { proxy: 'requires_approval', by: 'unit', source: 'test' });
-  return !core.requiresFreshProxyApproval(rule);
+ok('forever proxy grant has no expiry', (() => {
+  const rule = core.grantProxyAccess('railway', { durationMs: null, by: 'slack-user', source: 'unit' });
+  return rule.proxy === 'allowed' &&
+    rule.proxyGrant.exp === null &&
+    core.proxyGrantActive(rule);
+})());
+ok('expired proxy grant is inactive', (() => {
+  const rule = core.grantProxyAccess('railway', { durationMs: 1, by: 'slack-user', source: 'unit' });
+  return !core.proxyGrantActive(rule, Date.now() + 10);
+})());
+ok('denying future proxy approvals blocks KEYRING path', (() => {
+  const rule = core.denyProxyGrant('railway', { by: 'slack-user', source: 'unit' });
+  const latest = core.getAudit().slice(-1)[0];
+  return rule.proxy === 'denied' &&
+    rule.proxyGrant === null &&
+    latest.reason === 'proxy_access_denied';
+})());
+ok('slack approval blocks use signed links instead of interactive actions', (() => {
+  const blocks = slack.approvalBlocks(
+    { id: 'ap_test', taskId: 't', host: 'backboard.railway.com' },
+    { cli: 'railway', dashboardUrl: 'https://keyring.example' }
+  );
+  const body = JSON.stringify(blocks);
+  return body.includes('/api/slack/decision') &&
+    body.includes('Allow for 10 mins') &&
+    body.includes('Allow forever') &&
+    !body.includes('"action_id":"allow_10m"');
+})());
+ok('slack proxy use blocks use a signed deny-future link', (() => {
+  const blocks = slack.proxyUseBlocks(
+    { cli: 'railway', proxy: 'allowed', direct: 'blocked' },
+    { host: 'backboard.railway.com', taskId: 'default', dashboardUrl: 'https://keyring.example' }
+  );
+  const body = JSON.stringify(blocks);
+  return body.includes('/api/slack/decision') &&
+    body.includes('Deny future approvals') &&
+    !body.includes('"action_id":"deny_future"');
+})());
+ok('slack decision tokens verify only for the signed decision', (() => {
+  const token = slack.signDecision('ap_test', 'allow_10m');
+  return slack.verifyDecisionToken('ap_test', 'allow_10m', token) &&
+    !slack.verifyDecisionToken('ap_test', 'deny', token);
+})());
+ok('slack decision handler rejects missing pending approval before granting', (() => {
+  const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  const staleCheck = serverSource.indexOf('if (id && !before)');
+  const grant = serverSource.indexOf('core.grantProxyAccess((before && before.cli) || cli');
+  return staleCheck >= 0 && grant >= 0 && staleCheck < grant;
+})());
+ok('slack decision handler requires a current version for cli allow links', (() => {
+  const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  return serverSource.includes('version !== String(currentRule.updatedAt)') &&
+    serverSource.includes('stale Slack control link');
+})());
+ok('slack decision GET renders confirmation without mutating state', (() => {
+  const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  return serverSource.includes('Confirm KEYRING Slack decision') &&
+    serverSource.includes("if (req.method === 'POST' && u.pathname === '/api/slack/decision')") &&
+    !serverSource.includes("if (req.method === 'GET' && u.pathname === '/api/slack/decision') {\n    const decision = u.searchParams.get('decision')");
 })());
 ok('install wrapper resolves invoking user when sudo env is missing', (() => {
   const user = invoker.resolveInvokingUser({ USER: 'root', LOGNAME: 'root' }, () => 'axiom');
@@ -125,6 +220,40 @@ ok('install wrapper skips nested sudo when already root', (() => {
   return invocation.cmd === 'bash' &&
     invocation.args[0] === '/tmp/bootstrap.sh' &&
     invocation.env.SUDO_USER === 'axiom';
+})());
+ok('helper syncs successful CLI auth config changes back to invoking user', (() => {
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'bin', 'keyring-helper'), 'utf8');
+  return helper.includes('sync_back_configs') &&
+    helper.includes('config-sync-back') &&
+    helper.includes('cp -R "$src" "$dst"');
+})());
+ok('helper does not delete real auth config when temp config is absent', (() => {
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'bin', 'keyring-helper'), 'utf8');
+  return !helper.includes('elif [[ -e "$dst" ]]');
+})());
+ok('helper preserves railway auth config when sandbox only writes notices', (() => {
+  const helper = fs.readFileSync(path.join(__dirname, '..', 'bin', 'keyring-helper'), 'utf8');
+  return helper.includes('preserve_railway_auth_config') &&
+    helper.includes('auth_like_config "$dst/config.json"') &&
+    helper.includes('! auth_like_config "$src/config.json"');
+})());
+ok('keyring run preflights denied proxy state before launching real cli', (() => {
+  const cliSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8');
+  return cliSource.includes('railway_access_disabled_preflight') &&
+    cliSource.includes("accessRule.proxy === 'denied'");
+})());
+ok('keyring run asks Slack before launching railway when approval is required', (() => {
+  const cliSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8');
+  const preflight = cliSource.indexOf('await ensureRailwayProxyApproval');
+  const launch = cliSource.indexOf("'run',\n        invoker, configPaths");
+  return preflight >= 0 &&
+    cliSource.includes('KEYRING waiting for Slack approval before launching railway') &&
+    launch >= 0 &&
+    preflight < launch;
+})());
+ok('proxy waits long enough for Slack confirmation flow', (() => {
+  const proxySource = fs.readFileSync(path.join(__dirname, '..', 'src', 'proxy.js'), 'utf8');
+  return proxySource.includes("KEYRING_APPROVAL_TIMEOUT || '300000'");
 })());
 ok('env parser reads simple dotenv keys without comments', (() => {
   const parsed = env.parseDotEnv('SLACK_BOT_TOKEN=xoxb-test\n# comment\nSLACK_APPROVAL_CHANNEL=C123\nEMPTY=\n');

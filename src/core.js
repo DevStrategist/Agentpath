@@ -157,6 +157,7 @@ function ensureAccessRule(cli, opts = {}) {
         enforcement: opts.enforcement || 'real',
         direct: opts.direct || 'blocked',
         proxy: opts.proxy || 'requires_approval',
+        proxyGrant: opts.proxyGrant || null,
         hosts: opts.hosts || defaultAllowHostsForGatedClis([cli]),
         lastChangedBy: opts.by || 'system',
         lastChangedSource: opts.source || 'system',
@@ -182,13 +183,25 @@ function setAccessRule(cli, patch = {}) {
       enforcement: 'real',
       direct: 'blocked',
       proxy: 'requires_approval',
+      proxyGrant: null,
       hosts: defaultAllowHostsForGatedClis([cli])
     };
+    let proxyGrant = Object.prototype.hasOwnProperty.call(patch, 'proxyGrant') ? patch.proxyGrant : prev.proxyGrant || null;
+    if (patch.proxy === 'denied' || patch.proxy === 'requires_approval') proxyGrant = null;
+    if (patch.proxy === 'allowed' && !proxyGrant) {
+      proxyGrant = {
+        grantedAt: now(),
+        grantedBy: patch.by || 'unknown',
+        source: patch.source || 'unknown',
+        exp: null
+      };
+    }
     const next = {
       ...prev,
       enforcement: patch.enforcement || prev.enforcement,
       direct: patch.direct || prev.direct,
       proxy: patch.proxy || prev.proxy,
+      proxyGrant,
       hosts: patch.hosts || prev.hosts,
       lastChangedBy: patch.by || 'unknown',
       lastChangedSource: patch.source || 'unknown',
@@ -225,8 +238,44 @@ function setAccessRule(cli, patch = {}) {
     return next;
   });
 }
-function requiresFreshProxyApproval(rule) {
-  return !!rule && rule.cli === 'railway' && rule.proxy === 'requires_approval';
+function proxyGrantActive(rule, at = now()) {
+  if (!rule || rule.proxy !== 'allowed') return false;
+  // Backward compatibility for older demo state where `proxy: allowed` existed
+  // before explicit grant metadata.
+  if (!rule.proxyGrant) return true;
+  if (!rule.proxyGrant.exp) return true;
+  return at <= rule.proxyGrant.exp;
+}
+function grantProxyAccess(cli, opts = {}) {
+  const durationMs = Object.prototype.hasOwnProperty.call(opts, 'durationMs') ? opts.durationMs : null;
+  const grantedAt = now();
+  return setAccessRule(cli, {
+    proxy: 'allowed',
+    proxyGrant: {
+      grantedAt,
+      grantedBy: opts.by || 'unknown',
+      source: opts.source || 'unknown',
+      exp: durationMs ? grantedAt + Number(durationMs) : null
+    },
+    by: opts.by || 'unknown',
+    source: opts.source || 'unknown'
+  });
+}
+function requireProxyApproval(cli, opts = {}) {
+  return setAccessRule(cli, {
+    proxy: 'requires_approval',
+    proxyGrant: null,
+    by: opts.by || 'unknown',
+    source: opts.source || 'unknown'
+  });
+}
+function denyProxyGrant(cli, opts = {}) {
+  return setAccessRule(cli, {
+    proxy: 'denied',
+    proxyGrant: null,
+    by: opts.by || 'unknown',
+    source: opts.source || 'unknown'
+  });
 }
 
 // --- audit ---
@@ -248,6 +297,7 @@ module.exports = {
   hostAllowed, isSubset, coveredBy,
   addGate, listGates, getGate, removeGate, updateGate,
   defaultAllowHostsForGatedClis,
-  ensureAccessRule, getAccessRule, listAccessRules, setAccessRule, requiresFreshProxyApproval,
+  ensureAccessRule, getAccessRule, listAccessRules, setAccessRule,
+  proxyGrantActive, grantProxyAccess, requireProxyApproval, denyProxyGrant,
   addAudit, getAudit
 };

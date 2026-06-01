@@ -7,6 +7,8 @@ const fs = require('fs');
 const { resolveInvokingUser, bootstrapInvocation } = require('./invoker');
 require('./env').loadDotEnv();
 
+const DEFAULT_TASK = 'default';
+const DEFAULT_APPROVAL_TIMEOUT = parseInt(process.env.KEYRING_APPROVAL_TIMEOUT || '300000', 10);
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 const sub = argv[1] && !argv[1].startsWith('--') ? argv[1] : null;
@@ -63,6 +65,69 @@ function helperOrDie(...args) {
   return r.data;
 }
 
+async function ensureRailwayProxyApproval(cliName, accessRule, opts = {}) {
+  if (cliName !== 'railway') return;
+  if (!accessRule || accessRule.proxy !== 'requires_approval') return;
+  if (core.proxyGrantActive(accessRule)) return;
+
+  const slack = require('./slack');
+  const taskId = opts.taskId || process.env.KEYRING_TASK || DEFAULT_TASK;
+  const host = 'backboard.railway.com';
+  let task = core.getTask(taskId);
+  if (!task || task.status !== 'active') task = core.createTask(taskId);
+
+  const hosts = core.defaultAllowHostsForGatedClis([cliName]);
+  const grant = core.getGrant(taskId);
+  if (!core.verifyGrant(grant)) core.setGrant(taskId, hosts);
+
+  for (const old of ap.listPending(taskId).filter(p => p.host === host && p.cli === cliName)) {
+    ap.resolve(old.id, 'denied', 'superseded-by-preflight');
+  }
+
+  const pending = ap.createPending(taskId, host, { cli: cliName, preflight: true });
+  const ctx = {
+    cli: cliName,
+    invoker: opts.invoker,
+    allowHosts: hosts,
+    accessRule,
+    dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined
+  };
+  const r = await slack.notify(pending, ctx);
+  if (r && r.ok) ap.attachSlackTarget(pending.id, r.channel, r.ts);
+  else if (r && r.error && r.error !== 'slack_disabled') {
+    process.stderr.write(`[KEYRING] slack notify failed: ${r.error}\n`);
+  }
+
+  process.stderr.write(`KEYRING waiting for Slack approval before launching railway (${pending.id}).\n`);
+  if (!slack.isEnabled()) process.stderr.write(`Approve locally with: keyring approve --id ${pending.id}\n`);
+  const result = await ap.waitFor(pending.id, DEFAULT_APPROVAL_TIMEOUT);
+
+  if (slack.isEnabled()) {
+    const full = ap.getApproval(pending.id);
+    const target = full && full.slack;
+    if (target && target.channel && target.ts) {
+      const status = result.status === 'approved' ? 'approved' : 'denied';
+      const approver = result.approver || (result.status === 'timeout' ? 'timeout' : 'unknown');
+      slack.update(target, pending, status, approver, ctx).catch(() => {});
+    }
+  }
+
+  if (result.status !== 'approved') {
+    die(result.status === 'timeout'
+      ? `KEYRING timed out waiting for Slack approval before launching ${cliName}.`
+      : `KEYRING denied ${cliName} before launch.`);
+  }
+
+  const latestRule = core.getAccessRule(cliName);
+  if (!core.proxyGrantActive(latestRule)) {
+    core.grantProxyAccess(cliName, {
+      durationMs: 10 * 60 * 1000,
+      by: result.approver || 'preflight',
+      source: 'cli-preflight'
+    });
+  }
+}
+
 switch (cmd) {
   case 'task': {
     if (sub === 'create') { if (!flags.id) die('--id required'); ok(core.createTask(flags.id, flags.ttl ? Number(flags.ttl) : null)); }
@@ -111,7 +176,7 @@ switch (cmd) {
       slack.test().then(r => {
         if (r.ok) {
           console.log(JSON.stringify({ ok: true, posted_to: process.env.SLACK_APPROVAL_CHANNEL, channel: r.channel, ts: r.ts }, null, 2));
-          console.log('\nopen Slack — you should see an Allow/Deny prompt for "keyring-slack-test".');
+          console.log('\nopen Slack — you should see a 10-minute / forever / deny prompt for "keyring-slack-test".');
           console.log('clicking either button confirms your interactivity URL is wired correctly.');
         } else {
           die('slack post failed: ' + r.error);
@@ -199,41 +264,62 @@ switch (cmd) {
     break;
   }
   case 'run': {
-    if (!tailArgs.length) die('usage: keyring run [--proxy-port <p>] [--task <id>] -- <command> [args...]');
-    const proxyPort = flags['proxy-port'] || process.env.KEYRING_PROXY_PORT || '8080';
-    const [binArg, ...rest] = tailArgs;
-    // Resolve to absolute path so the helper (running as root) can locate it.
-    const absBin = binArg.startsWith('/') ? binArg : which(binArg);
-    if (!absBin || !fs.existsSync(absBin)) die(`binary not found: ${binArg}`);
-    // When a shim execs `keyring run -- /opt/.../railway.keyring-real ...`, strip the
-    // .keyring-real suffix so we look up the gate by its real name (railway) and apply
-    // the right configPaths / audit cli field.
-    const cliName = path.basename(absBin).replace(/\.keyring-real$/, '');
-    const gate = core.getGate(cliName);
-    const invoker = process.env.SUDO_USER || process.env.USER;
-    const configPaths = (gate && gate.configPaths) ? gate.configPaths.join(',') : '';
+    (async () => {
+      if (!tailArgs.length) die('usage: keyring run [--proxy-port <p>] [--task <id>] -- <command> [args...]');
+      const proxyPort = flags['proxy-port'] || process.env.KEYRING_PROXY_PORT || '8080';
+      const [binArg, ...rest] = tailArgs;
+      // Resolve to absolute path so the helper (running as root) can locate it.
+      const absBin = binArg.startsWith('/') ? binArg : which(binArg);
+      if (!absBin || !fs.existsSync(absBin)) die(`binary not found: ${binArg}`);
+      // When a shim execs `keyring run -- /opt/.../railway.keyring-real ...`, strip the
+      // .keyring-real suffix so we look up the gate by its real name (railway) and apply
+      // the right configPaths / audit cli field.
+      const cliName = path.basename(absBin).replace(/\.keyring-real$/, '');
+      const gate = core.getGate(cliName);
+      const invoker = process.env.SUDO_USER || process.env.USER;
+      const configPaths = (gate && gate.configPaths) ? gate.configPaths.join(',') : '';
+      const accessRule = core.getAccessRule(cliName);
 
-    // Audit the invocation up front (independent of whether KEYRING is running).
-    core.addAudit({
-      taskId: flags.task || null,
-      host: null,
-      decision: 'invoked',
-      reason: gate ? 'gated_cli_invoked' : 'ungated_cli_invoked',
-      cli: cliName,
-      argv: rest
-    });
+      if (accessRule && accessRule.proxy === 'denied') {
+        core.addAudit({
+          taskId: flags.task || null,
+          host: null,
+          decision: 'denied',
+          reason: 'railway_access_disabled_preflight',
+          cli: cliName,
+          argv: rest
+        });
+        die(`KEYRING blocked ${cliName}: proxy access is denied. Use the dashboard or Slack to require approval again.`);
+      }
 
-    // Hand off to the helper, which drops to keyring-jail with a temp HOME holding
-    // copies of the invoker's config paths. Stdio flows through inherit.
-    const r = spawnSync('sudo', [
-      '-n', HELPER, 'run',
-      invoker, configPaths, String(proxyPort), absBin, ...rest
-    ], { stdio: 'inherit' });
-    if (r.error) die(`could not invoke helper: ${r.error.message}`);
-    if (r.status === 1 && !rest.length && !fs.existsSync(HELPER)) {
-      die('KEYRING privileged helper not installed. run once:  sudo keyring install');
-    }
-    process.exit(r.status === null ? 1 : r.status);
+      await ensureRailwayProxyApproval(cliName, accessRule, {
+        taskId: flags.task || null,
+        invoker
+      });
+
+      // Audit the invocation up front (independent of whether KEYRING is running).
+      core.addAudit({
+        taskId: flags.task || null,
+        host: null,
+        decision: 'invoked',
+        reason: gate ? 'gated_cli_invoked' : 'ungated_cli_invoked',
+        cli: cliName,
+        argv: rest
+      });
+
+      // Hand off to the helper, which drops to keyring-jail with a temp HOME holding
+      // copies of the invoker's config paths. Stdio flows through inherit.
+      const r = spawnSync('sudo', [
+        '-n', HELPER, 'run',
+        invoker, configPaths, String(proxyPort), absBin, ...rest
+      ], { stdio: 'inherit' });
+      if (r.error) die(`could not invoke helper: ${r.error.message}`);
+      if (r.status === 1 && !rest.length && !fs.existsSync(HELPER)) {
+        die('KEYRING privileged helper not installed. run once:  sudo keyring install');
+      }
+      process.exit(r.status === null ? 1 : r.status);
+    })().catch(e => die(e.message));
+    break;
   }
   case 'jail': {
     const action = sub || 'status';
