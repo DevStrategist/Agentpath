@@ -55,8 +55,10 @@ server.on('connect', async (req, clientSocket, head) => {
     core.addAudit({ taskId, host, decision: 'denied', reason: 'railway_access_disabled', cli, accessDirect: accessRule.direct });
     return refuse(clientSocket, 403, 'Railway Access Disabled');
   }
-  // 4) human approval, cached per (task, host)
-  let appr = ap.findApproval(taskId, host);
+  // 4) human approval. Most hosts cache per (task, host); Railway demo mode asks fresh
+  // for every proxied connection so the human sees each CLI access attempt.
+  const freshApproval = core.requiresFreshProxyApproval(accessRule);
+  let appr = freshApproval ? null : ap.findApproval(taskId, host);
   if (appr && appr.status === 'denied') {
     core.addAudit({ taskId, host, decision: 'denied', reason: 'approval_denied', approver: appr.approver });
     return refuse(clientSocket, 403, 'Denied By Human');
@@ -69,6 +71,7 @@ server.on('connect', async (req, clientSocket, head) => {
     const ctx = {
       cli,
       accessRule,
+      freshApproval,
       invoker: process.env.SUDO_USER || process.env.USER || undefined,
       allowHosts: grant.allowHosts,
       recentApproved: recent.filter(e => e.decision === 'allowed').length,

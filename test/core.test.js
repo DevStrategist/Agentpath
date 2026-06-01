@@ -107,6 +107,14 @@ ok('proxy access can be returned to approval mode', (() => {
   return rule.proxy === 'requires_approval' &&
     latest.reason === 'proxy_access_requires_approval';
 })());
+ok('railway proxy approval mode requires fresh approval instead of cache', (() => {
+  const rule = core.setAccessRule('railway', { proxy: 'requires_approval', by: 'unit', source: 'test' });
+  return core.requiresFreshProxyApproval(rule);
+})());
+ok('non-railway rules can still use cached host approvals', (() => {
+  const rule = core.setAccessRule('gh', { proxy: 'requires_approval', by: 'unit', source: 'test' });
+  return !core.requiresFreshProxyApproval(rule);
+})());
 ok('install wrapper resolves invoking user when sudo env is missing', (() => {
   const user = invoker.resolveInvokingUser({ USER: 'root', LOGNAME: 'root' }, () => 'axiom');
   return user === 'axiom';

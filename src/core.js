@@ -225,6 +225,9 @@ function setAccessRule(cli, patch = {}) {
     return next;
   });
 }
+function requiresFreshProxyApproval(rule) {
+  return !!rule && rule.cli === 'railway' && rule.proxy === 'requires_approval';
+}
 
 // --- audit ---
 function addAudit(ev) {
@@ -245,6 +248,6 @@ module.exports = {
   hostAllowed, isSubset, coveredBy,
   addGate, listGates, getGate, removeGate, updateGate,
   defaultAllowHostsForGatedClis,
-  ensureAccessRule, getAccessRule, listAccessRules, setAccessRule,
+  ensureAccessRule, getAccessRule, listAccessRules, setAccessRule, requiresFreshProxyApproval,
   addAudit, getAudit
 };

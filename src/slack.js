@@ -38,7 +38,7 @@ function approvalBlocks(pending, ctx = {}) {
   return [
     { type: 'header', text: { type: 'plain_text', text: '🔑 KEYRING approval requested' } },
     { type: 'section', text: { type: 'mrkdwn',
-      text: `KEYRING is holding a connection from ${cli} to *${pending.host}* (task *${pending.taskId}*). Approve to tunnel; deny to refuse.` } },
+      text: `KEYRING is holding a connection from ${cli} to *${pending.host}* (task *${pending.taskId}*). Approve to tunnel; deny to refuse.${ctx.freshApproval ? ' Railway approvals are requested for each proxied connection.' : ''}` } },
     { type: 'context', elements },
     { type: 'actions', elements: [
       { type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Allow' }, action_id: 'allow', value: pending.id },
