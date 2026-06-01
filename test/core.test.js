@@ -168,6 +168,10 @@ ok('denying future proxy approvals blocks KEYRING path', (() => {
     rule.proxyGrant === null &&
     latest.reason === 'proxy_access_denied';
 })());
+ok('runtime config stores the current dashboard url for long-running proxy processes', (() => {
+  core.setRuntimeConfig({ dashboardUrl: 'https://fresh.example' });
+  return core.getRuntimeConfig().dashboardUrl === 'https://fresh.example';
+})());
 ok('slack approval blocks use signed links instead of interactive actions', (() => {
   const blocks = slack.approvalBlocks(
     { id: 'ap_test', taskId: 't', host: 'backboard.railway.com' },
@@ -188,6 +192,18 @@ ok('slack proxy use blocks use a signed deny-future link', (() => {
   return body.includes('/api/slack/decision') &&
     body.includes('Deny future approvals') &&
     !body.includes('"action_id":"deny_future"');
+})());
+ok('slack proxy denied blocks offer temporary and forever allow links', (() => {
+  const blocks = slack.proxyDeniedBlocks(
+    { cli: 'railway', proxy: 'denied', direct: 'blocked', updatedAt: 12345 },
+    { argv: ['whoami'], invoker: 'axiom', dashboardUrl: 'https://keyring.example' }
+  );
+  const body = JSON.stringify(blocks);
+  return body.includes('command was blocked') &&
+    body.includes('Allow for 10 mins') &&
+    body.includes('Allow forever') &&
+    body.includes('Require approval') &&
+    body.includes('version=12345');
 })());
 ok('slack decision tokens verify only for the signed decision', (() => {
   const token = slack.signDecision('ap_test', 'allow_10m');
@@ -239,7 +255,12 @@ ok('helper preserves railway auth config when sandbox only writes notices', (() 
 })());
 ok('keyring run preflights denied proxy state before launching real cli', (() => {
   const cliSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8');
+  const notify = cliSource.indexOf('await notifyRailwayProxyDenied');
+  const dieCall = cliSource.indexOf('KEYRING blocked ${cliName}: proxy access is denied');
   return cliSource.includes('railway_access_disabled_preflight') &&
+    notify >= 0 &&
+    dieCall >= 0 &&
+    notify < dieCall &&
     cliSource.includes("accessRule.proxy === 'denied'");
 })());
 ok('keyring run asks Slack before launching railway when approval is required', (() => {
@@ -254,6 +275,10 @@ ok('keyring run asks Slack before launching railway when approval is required', 
 ok('proxy waits long enough for Slack confirmation flow', (() => {
   const proxySource = fs.readFileSync(path.join(__dirname, '..', 'src', 'proxy.js'), 'utf8');
   return proxySource.includes("KEYRING_APPROVAL_TIMEOUT || '300000'");
+})());
+ok('proxy reads dashboard url from shared runtime config', (() => {
+  const proxySource = fs.readFileSync(path.join(__dirname, '..', 'src', 'proxy.js'), 'utf8');
+  return proxySource.includes('core.getRuntimeConfig().dashboardUrl');
 })());
 ok('env parser reads simple dotenv keys without comments', (() => {
   const parsed = env.parseDotEnv('SLACK_BOT_TOKEN=xoxb-test\n# comment\nSLACK_APPROVAL_CHANNEL=C123\nEMPTY=\n');

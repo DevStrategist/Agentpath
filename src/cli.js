@@ -37,6 +37,13 @@ const which = (bin) => {
 const jailDir = path.join(__dirname, '..', 'jail');
 const HELPER = '/usr/local/libexec/keyring-helper';
 
+function dashboardUrl() {
+  return core.getRuntimeConfig().dashboardUrl || process.env.KEYRING_DASHBOARD_URL || undefined;
+}
+if (process.env.KEYRING_DASHBOARD_URL) {
+  core.setRuntimeConfig({ dashboardUrl: process.env.KEYRING_DASHBOARD_URL });
+}
+
 // Call the privileged helper non-interactively via sudo. Returns { ok, data, error, raw }.
 // If sudoers isn't set up yet, returns { ok:false, error:'not_installed' } so callers can
 // tell the user to run `sudo keyring install` first.
@@ -90,7 +97,7 @@ async function ensureRailwayProxyApproval(cliName, accessRule, opts = {}) {
     invoker: opts.invoker,
     allowHosts: hosts,
     accessRule,
-    dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined
+    dashboardUrl: dashboardUrl()
   };
   const r = await slack.notify(pending, ctx);
   if (r && r.ok) ap.attachSlackTarget(pending.id, r.channel, r.ts);
@@ -125,6 +132,20 @@ async function ensureRailwayProxyApproval(cliName, accessRule, opts = {}) {
       by: result.approver || 'preflight',
       source: 'cli-preflight'
     });
+  }
+}
+
+async function notifyRailwayProxyDenied(cliName, accessRule, opts = {}) {
+  if (cliName !== 'railway' || !accessRule) return;
+  const slack = require('./slack');
+  const r = await slack.notifyProxyDenied(accessRule, {
+    cli: cliName,
+    invoker: opts.invoker,
+    argv: opts.argv || [],
+    dashboardUrl: dashboardUrl()
+  }).catch(e => ({ ok: false, error: e.message }));
+  if (r && r.error && r.error !== 'slack_disabled') {
+    process.stderr.write(`[KEYRING] slack denied notify failed: ${r.error}\n`);
   }
 }
 
@@ -289,6 +310,7 @@ switch (cmd) {
           cli: cliName,
           argv: rest
         });
+        await notifyRailwayProxyDenied(cliName, accessRule, { invoker, argv: rest });
         die(`KEYRING blocked ${cliName}: proxy access is denied. Use the dashboard or Slack to require approval again.`);
       }
 

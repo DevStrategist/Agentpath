@@ -18,6 +18,13 @@ const PROXY_LOG_FILE = path.join(os.tmpdir(), 'keyring-proxy.log');
 const DEFAULT_PROXY_PORT = parseInt(process.env.KEYRING_PROXY_PORT || '8080', 10);
 const DEFAULT_TASK = 'default';
 
+function dashboardUrl() {
+  return core.getRuntimeConfig().dashboardUrl || process.env.KEYRING_DASHBOARD_URL || undefined;
+}
+if (process.env.KEYRING_DASHBOARD_URL) {
+  core.setRuntimeConfig({ dashboardUrl: process.env.KEYRING_DASHBOARD_URL });
+}
+
 function probePort(port) {
   return new Promise(resolve => {
     const s = net.createConnection({ host: '127.0.0.1', port, timeout: 500 });
@@ -191,7 +198,7 @@ async function handleSlackDecision(params, res) {
   if (resolved && before && before.slack && slack.isEnabled()) {
     slack.update(before.slack, resolved, status, who, {
       cli: before.cli || cli,
-      dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined
+      dashboardUrl: dashboardUrl()
     }).catch(e => process.stderr.write(`slack.update failed: ${e.message}\n`));
   }
   return sendText(res, 200, status === 'approved'
@@ -252,7 +259,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && u.pathname.match(/^\/api\/access-rules\/[^/]+\/notify$/)) {
     const name = decodeURIComponent(u.pathname.split('/')[3]);
     const rule = core.getAccessRule(name) || core.ensureAccessRule(name);
-    const r = await slack.notifyAccessRule(rule, { dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined });
+    const r = await slack.notifyAccessRule(rule, { dashboardUrl: dashboardUrl() });
     return send(res, r.ok ? 200 : 500, r.ok ? r : { error: r.error });
   }
   if (req.method === 'GET' && u.pathname === '/api/discovered-clis') {
@@ -439,6 +446,9 @@ const server = http.createServer(async (req, res) => {
     if (!okSig) return send(res, 401, { error: 'bad_signature' });
     const payload = JSON.parse(querystring.parse(raw).payload || '{}');
     const action = (payload.actions || [])[0] || {};
+    if (action.action_id && action.action_id.startsWith('proxy_link_')) {
+      return send(res, 200, '');
+    }
     if (action.action_id === 'access_block' || action.action_id === 'access_unblock') {
       const who = '@' + ((payload.user && payload.user.username) || 'slack');
       const rule = core.setAccessRule(action.value || 'railway', {
@@ -448,7 +458,7 @@ const server = http.createServer(async (req, res) => {
       });
       const target = payload.response_url ? { responseUrl: payload.response_url } : {};
       if (target.responseUrl) {
-        slack.updateAccessRule(target, rule, who, { dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined })
+        slack.updateAccessRule(target, rule, who, { dashboardUrl: dashboardUrl() })
           .catch(e => process.stderr.write(`slack.updateAccessRule failed: ${e.message}\n`));
       }
       return send(res, 200, '');
@@ -461,7 +471,7 @@ const server = http.createServer(async (req, res) => {
       });
       const target = payload.response_url ? { responseUrl: payload.response_url } : {};
       if (target.responseUrl) {
-        slack.updateProxyUseDenied(target, rule, who, { dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined })
+        slack.updateProxyUseDenied(target, rule, who, { dashboardUrl: dashboardUrl() })
           .catch(e => process.stderr.write(`slack.updateProxyUseDenied failed: ${e.message}\n`));
       }
       return send(res, 200, '');

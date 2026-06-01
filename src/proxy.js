@@ -13,6 +13,10 @@ const TIMEOUT = parseInt(process.env.KEYRING_APPROVAL_TIMEOUT || '300000', 10);
 const AUTO = process.env.KEYRING_AUTO_APPROVE === '1';
 const PORT = parseInt(process.env.KEYRING_PROXY_PORT || '8080', 10);
 
+function dashboardUrl() {
+  return core.getRuntimeConfig().dashboardUrl || process.env.KEYRING_DASHBOARD_URL || undefined;
+}
+
 function inferCli(host, headers = {}) {
   if (headers['x-keyring-cli']) return headers['x-keyring-cli'];
   return host === 'railway.com' || host.endsWith('.railway.com') ? 'railway' : undefined;
@@ -65,7 +69,7 @@ server.on('connect', async (req, clientSocket, head) => {
     allowHosts: grant.allowHosts,
     recentApproved: recent.filter(e => e.decision === 'allowed').length,
     recentDenied: recent.filter(e => e.decision === 'denied').length,
-    dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined,
+    dashboardUrl: dashboardUrl(),
     ...extra
   });
 

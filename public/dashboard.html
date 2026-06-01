@@ -246,10 +246,10 @@
       box-shadow: 0 10px 30px color-mix(in oklch, var(--ink) 7%, transparent);
     }
     .flow-node.strong {
-      background: var(--ink);
-      color: oklch(97% 0.008 155);
-      border-color: color-mix(in oklch, var(--ink) 70%, var(--brand));
-      min-height: 168px;
+      background: color-mix(in oklch, var(--surface) 94%, var(--brand-soft));
+      color: var(--ink);
+      border-color: color-mix(in oklch, var(--brand) 34%, var(--line));
+      min-height: 232px;
       align-content: center;
       position: relative;
       overflow: hidden;
@@ -257,12 +257,13 @@
     .flow-node.strong::after {
       content: "";
       position: absolute;
-      inset: auto -20% -54% 18%;
-      height: 160px;
-      background: color-mix(in oklch, var(--brand) 48%, transparent);
+      inset: -80px -70px auto auto;
+      width: 180px;
+      height: 180px;
+      background: color-mix(in oklch, var(--brand-soft) 72%, transparent);
       border-radius: 999px;
-      filter: blur(22px);
-      opacity: .42;
+      filter: blur(18px);
+      opacity: .8;
     }
     .flow-node.warn-node {
       border-color: color-mix(in oklch, var(--danger) 45%, var(--line));
@@ -287,7 +288,51 @@
       z-index: 1;
     }
     .flow-node.strong .flow-node-meta {
-      color: oklch(82% 0.025 155);
+      color: color-mix(in oklch, var(--muted) 86%, var(--brand));
+    }
+    .control-steps {
+      display: grid;
+      gap: var(--space-xs);
+      position: relative;
+      z-index: 1;
+    }
+    .control-step {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: var(--space-xs);
+      min-height: 46px;
+      border: 1px solid color-mix(in oklch, var(--line) 72%, transparent);
+      border-radius: var(--radius);
+      background: color-mix(in oklch, var(--surface) 82%, transparent);
+      padding: var(--space-xs);
+    }
+    .control-dot {
+      width: 26px;
+      height: 26px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      font-size: .76rem;
+      font-weight: 900;
+      background: var(--info-soft);
+      color: var(--info);
+    }
+    .control-dot.ok { background: var(--brand-soft); color: var(--brand); }
+    .control-dot.bad { background: var(--danger-soft); color: var(--danger); }
+    .control-step-main {
+      display: grid;
+      gap: 1px;
+      min-width: 0;
+    }
+    .control-step-main strong {
+      font-size: .9rem;
+      line-height: 1.15;
+    }
+    .control-step-main span {
+      color: var(--muted);
+      font-size: .76rem;
+      overflow-wrap: anywhere;
     }
     .flow-stack {
       display: grid;
@@ -305,13 +350,14 @@
       gap: 2px;
       padding: var(--space-xs);
       border-radius: var(--radius);
-      background: color-mix(in oklch, var(--surface) 9%, transparent);
+      border: 1px solid color-mix(in oklch, var(--line) 72%, transparent);
+      background: color-mix(in oklch, var(--surface-2) 58%, transparent);
     }
     .flow-metric strong {
       font: 800 1rem/1 var(--display);
     }
     .flow-metric span {
-      color: oklch(82% 0.025 155);
+      color: var(--muted);
       font-size: .7rem;
       font-weight: 700;
     }
@@ -811,10 +857,32 @@
           <div class="flow-label">Control Plane</div>
           <div class="flow-node strong ${routeTone === 'bad' ? 'warn-node' : ''}">
             <div class="flow-node-head">
-              <div class="flow-node-name">KEYRING</div>
+              <div class="flow-node-name">KEYRING Policy Router</div>
               ${badge(routeLabel, routeTone)}
             </div>
-            <div class="flow-node-meta">Helper, jail, proxy, host scope, and human approval converge here before traffic leaves the machine.</div>
+            <div class="flow-node-meta">The center is an enforcement sequence, not a black box. Each check has to pass before traffic leaves the machine.</div>
+            <div class="control-steps">
+              <div class="control-step">
+                <div class="control-dot ${helperReady ? 'ok' : 'bad'}">${helperReady ? '1' : '!'}</div>
+                <div class="control-step-main"><strong>Privileged helper</strong><span>${helperReady ? 'Installed and ready for local enforcement.' : 'Missing; install before managing the jail.'}</span></div>
+                ${badge(helperReady ? 'Ready' : 'Missing', helperReady ? 'ok' : 'bad')}
+              </div>
+              <div class="control-step">
+                <div class="control-dot ${jailUp ? 'ok' : 'bad'}">${jailUp ? '2' : '!'}</div>
+                <div class="control-step-main"><strong>Agent jail</strong><span>${jailUp ? `${jail.rule_count || 0} pf rules constrain the agent route.` : 'Rules are not loaded.'}</span></div>
+                ${badge(jailUp ? 'Jailed' : 'Open', jailUp ? 'ok' : 'bad')}
+              </div>
+              <div class="control-step">
+                <div class="control-dot ${proxyUp ? 'ok' : 'bad'}">${proxyUp ? '3' : '!'}</div>
+                <div class="control-step-main"><strong>Egress proxy</strong><span>${proxyUp ? `Listening on port ${proxy.port}; ${proxy.blockedIpCount || 0} IPs blocked.` : 'Stopped; shimmed CLIs fail closed.'}</span></div>
+                ${badge(proxyUp ? 'Online' : 'Down', proxyUp ? 'ok' : 'bad')}
+              </div>
+              <div class="control-step">
+                <div class="control-dot ${railwayProxyDenied ? 'bad' : (railwayProxyAllowed ? 'ok' : '')}">${railwayProxyDenied ? '!' : '4'}</div>
+                <div class="control-step-main"><strong>Human approval</strong><span>${railwayProxyDenied ? 'Railway proxy requests are denied.' : (railwayProxyAllowed ? 'Railway proxy requests are currently allowed.' : 'Next request waits for approval.')}</span></div>
+                ${badge(railwayProxyDenied ? 'Denied' : (railwayProxyAllowed ? 'Allowed' : 'Waiting'), railwayProxyDenied ? 'bad' : (railwayProxyAllowed ? 'ok' : 'info'))}
+              </div>
+            </div>
             <div class="flow-metric-row">
               <div class="flow-metric"><strong>${helperReady ? 'On' : 'Off'}</strong><span>Helper</span></div>
               <div class="flow-metric"><strong>${proxyUp ? 'Up' : 'Down'}</strong><span>Proxy</span></div>

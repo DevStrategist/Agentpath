@@ -278,6 +278,18 @@ function denyProxyGrant(cli, opts = {}) {
   });
 }
 
+// --- runtime config shared between dashboard, CLI, and long-running proxy ---
+function setRuntimeConfig(patch = {}) {
+  return update(s => {
+    if (!s.runtimeConfig) s.runtimeConfig = {};
+    s.runtimeConfig = { ...s.runtimeConfig, ...patch, updatedAt: now() };
+    return s.runtimeConfig;
+  });
+}
+function getRuntimeConfig() {
+  return load().runtimeConfig || {};
+}
+
 // --- audit ---
 function addAudit(ev) {
   return update(s => {
@@ -299,5 +311,6 @@ module.exports = {
   defaultAllowHostsForGatedClis,
   ensureAccessRule, getAccessRule, listAccessRules, setAccessRule,
   proxyGrantActive, grantProxyAccess, requireProxyApproval, denyProxyGrant,
+  setRuntimeConfig, getRuntimeConfig,
   addAudit, getAudit
 };

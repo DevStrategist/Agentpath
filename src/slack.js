@@ -175,16 +175,72 @@ function proxyUseBlocks(rule, ctx = {}) {
   ];
 }
 
+function proxyControlUrls(rule, ctx = {}) {
+  const cli = rule && rule.cli ? rule.cli : (ctx.cli || 'railway');
+  const version = rule && rule.updatedAt !== undefined && rule.updatedAt !== null ? String(rule.updatedAt) : undefined;
+  return {
+    allow10: decisionLink(ctx.dashboardUrl, { cli, decision: 'allow_10m', version }),
+    allowForever: decisionLink(ctx.dashboardUrl, { cli, decision: 'allow_forever', version }),
+    requireApproval: decisionLink(ctx.dashboardUrl, { cli, decision: 'require_approval', version })
+  };
+}
+
+function proxyControlButton(text, url, actionId, style) {
+  if (!url) return null;
+  const button = {
+    type: 'button',
+    text: { type: 'plain_text', text },
+    url,
+    action_id: actionId
+  };
+  if (style) button.style = style;
+  return button;
+}
+
 function proxyUseDeniedBlocks(rule, actor, ctx = {}) {
   const cli = rule && rule.cli ? rule.cli : (ctx.cli || 'cli');
   const host = ctx.host || 'future Railway connections';
+  const urls = proxyControlUrls(rule, ctx);
+  const buttons = [
+    proxyControlButton('Allow for 10 mins', urls.allow10, 'proxy_link_allow_10m', 'primary'),
+    proxyControlButton('Allow forever', urls.allowForever, 'proxy_link_allow_forever'),
+    proxyControlButton('Require approval', urls.requireApproval, 'proxy_link_require_approval')
+  ].filter(Boolean);
   return [
     { type: 'header', text: { type: 'plain_text', text: '⛔ KEYRING Railway access disabled' } },
     { type: 'section', text: { type: 'mrkdwn',
       text: `Future \`${cli}\` proxy connections are now denied.` } },
     { type: 'context', elements: [
       { type: 'mrkdwn', text: `Changed by *${actor || 'unknown'}* · last host \`${host}\`` }
-    ]}
+    ]},
+    buttons.length
+      ? { type: 'actions', elements: buttons }
+      : { type: 'section', text: { type: 'mrkdwn', text: 'Allow links unavailable. Set `KEYRING_DASHBOARD_URL`.' } }
+  ];
+}
+
+function proxyDeniedBlocks(rule, ctx = {}) {
+  const cli = rule && rule.cli ? rule.cli : (ctx.cli || 'cli');
+  const argv = Array.isArray(ctx.argv) && ctx.argv.length ? ` \`${ctx.argv.join(' ')}\`` : '';
+  const elements = [
+    { type: 'mrkdwn', text: `*CLI* \`${cli}\` · *Proxy* \`${(rule && rule.proxy) || 'denied'}\`` }
+  ];
+  if (ctx.invoker) elements.push({ type: 'mrkdwn', text: `*Invoked by* \`${ctx.invoker}\`` });
+  if (ctx.dashboardUrl) elements.push({ type: 'mrkdwn', text: `<${ctx.dashboardUrl}|Open dashboard>` });
+  const urls = proxyControlUrls(rule, ctx);
+  const buttons = [
+    proxyControlButton('Allow for 10 mins', urls.allow10, 'proxy_link_allow_10m', 'primary'),
+    proxyControlButton('Allow forever', urls.allowForever, 'proxy_link_allow_forever'),
+    proxyControlButton('Require approval', urls.requireApproval, 'proxy_link_require_approval')
+  ].filter(Boolean);
+  return [
+    { type: 'header', text: { type: 'plain_text', text: '⛔ KEYRING Railway command blocked' } },
+    { type: 'section', text: { type: 'mrkdwn',
+      text: `A \`${cli}\` command was blocked because KEYRING proxy access is denied.${argv}` } },
+    { type: 'context', elements },
+    buttons.length
+      ? { type: 'actions', elements: buttons }
+      : { type: 'section', text: { type: 'mrkdwn', text: 'Allow links unavailable. Set `KEYRING_DASHBOARD_URL`.' } }
   ];
 }
 
@@ -301,6 +357,19 @@ async function notifyProxyUse(rule, ctx = {}) {
   return { ok: true, channel: r.body.channel, ts: r.body.ts };
 }
 
+async function notifyProxyDenied(rule, ctx = {}) {
+  if (!isEnabled()) return { ok: false, error: 'slack_disabled' };
+  const channel = process.env.SLACK_APPROVAL_CHANNEL;
+  if (!channel) return { ok: false, error: 'channel_unset' };
+  const r = await withRetry(() => postJson('/api/chat.postMessage', {
+    channel,
+    text: `KEYRING blocked ${rule.cli} because proxy access is denied`,
+    blocks: proxyDeniedBlocks(rule, ctx)
+  }));
+  if (!r.body || !r.body.ok) return { ok: false, error: (r.body && r.body.error) || 'http_' + r.status };
+  return { ok: true, channel: r.body.channel, ts: r.body.ts };
+}
+
 // Edits the approval message to remove buttons and show the outcome.
 // Pass either { channel, ts } (chat.update path) or { responseUrl } (faster, no auth needed —
 // Slack gives us this on interactivity callbacks).
@@ -388,9 +457,9 @@ function verifySignature(rawBody, timestamp, signature) {
 }
 
 module.exports = {
-  notify, notifyAccessRule, notifyProxyUse,
+  notify, notifyAccessRule, notifyProxyUse, notifyProxyDenied,
   update, updateAccessRule, updateProxyUseDenied,
   test, verifySignature, isEnabled,
   signDecision, verifyDecisionToken,
-  approvalBlocks, resolvedBlocks, accessRuleBlocks, proxyUseBlocks // exported for tests
+  approvalBlocks, resolvedBlocks, accessRuleBlocks, proxyUseBlocks, proxyDeniedBlocks // exported for tests
 };
