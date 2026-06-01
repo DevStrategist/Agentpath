@@ -31,6 +31,10 @@
     <h2>Egress proxy <span id="proxy-meta" class="sub" style="margin-left:8px;font-weight:normal"></span></h2>
     <div id="proxy-state" style="padding:12px 16px"></div>
   </div>
+  <div class="card" id="access-card">
+    <h2>Railway access control <span id="access-meta" class="sub" style="margin-left:8px;font-weight:normal"></span></h2>
+    <div id="access-state" style="padding:12px 16px"><div class="empty">loading…</div></div>
+  </div>
   <div class="card">
     <h2>Discovered CLIs <span id="disc-meta" class="sub" style="margin-left:8px;font-weight:normal"></span></h2>
     <div style="padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -116,6 +120,27 @@ document.addEventListener('click', async (ev) => {
     const j2 = await r.json().catch(()=>({}));
     if (r.ok) banner(`proxy stopped${j2.killed_pid?` (pid ${j2.killed_pid})`:''}`, 'warn');
     else banner(`stop failed: ${j2.error||r.status}`, 'err');
+    tick(); return;
+  }
+  if (ev.target.id === 'btn-access-block' || ev.target.id === 'btn-access-unblock') {
+    const action = ev.target.id === 'btn-access-block' ? 'block' : 'unblock';
+    ev.target.disabled = true;
+    const r = await fetch('/api/access-rules/railway/' + action, {
+      method: 'POST',
+      headers: {'content-type':'application/json'},
+      body: JSON.stringify({ by: 'dashboard', source: 'dashboard' })
+    });
+    const j2 = await r.json().catch(()=>({}));
+    if (r.ok) banner(`railway direct access is ${j2.direct}`, j2.direct === 'blocked' ? 'ok' : 'warn');
+    else banner(`railway access update failed: ${j2.error||r.status}`, 'err');
+    tick(); return;
+  }
+  if (ev.target.id === 'btn-access-notify') {
+    ev.target.disabled = true; ev.target.innerText = 'Sending…';
+    const r = await fetch('/api/access-rules/railway/notify', { method: 'POST' });
+    const j2 = await r.json().catch(()=>({}));
+    if (r.ok) banner('posted Railway access controls to Slack', 'ok');
+    else banner(`Slack notify failed: ${j2.error||r.status}`, 'err');
     tick(); return;
   }
 
@@ -225,6 +250,31 @@ async function tick(){
            <button class="btn allow" id="btn-proxy-start" style="margin-top:10px">Start proxy</button>
          </div>`;
     pstate.innerHTML = stateLine;
+    const ar = await j('/api/access-rules/railway');
+    const acard = document.getElementById('access-card');
+    const astate = document.getElementById('access-state');
+    const ameta = document.getElementById('access-meta');
+    acard.style.display = 'block';
+    const blocked = ar.direct === 'blocked';
+    ameta.textContent = `${ar.direct} · ${ar.enforcement} enforcement · proxy ${ar.proxy}`;
+    ameta.style.color = blocked ? '#5fe39a' : '#ff8a99';
+    astate.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+      <div>
+        <span class="pill ${blocked?'allowed':'denied'}">${blocked?'DIRECT BLOCKED':'DIRECT UNBLOCKED'}</span>
+        <span class="reason" style="margin-left:10px">agent route: KEYRING proxy</span>
+        <span class="reason" style="margin-left:10px">changed by ${esc(ar.lastChangedBy||'system')}</span>
+      </div>
+      <div>
+        <button class="btn allow" id="btn-access-block" ${blocked?'disabled':''}>Block direct Railway</button>
+        <button class="btn deny" id="btn-access-unblock" ${blocked?'':'disabled'}>Unblock direct Railway</button>
+        <button class="btn" id="btn-access-notify">Notify Slack</button>
+      </div>
+    </div>
+    <div class="reason" style="margin-top:8px">
+      ${blocked
+        ? 'Direct railway egress is blocked; approved operations must go through KEYRING.'
+        : 'Direct railway egress is unblocked. Block it before running the protected demo path.'}
+    </div>`;
     const jail=await j('/api/jail');
     const badge=document.getElementById('jailbadge');
     const card=document.getElementById('jail-card');

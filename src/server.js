@@ -100,6 +100,31 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && u.pathname === '/api/gates') {
     return send(res, 200, core.listGates());
   }
+  if (req.method === 'GET' && u.pathname === '/api/access-rules') {
+    return send(res, 200, core.listAccessRules());
+  }
+  if (req.method === 'GET' && u.pathname.match(/^\/api\/access-rules\/[^/]+$/)) {
+    const name = decodeURIComponent(u.pathname.split('/')[3]);
+    return send(res, 200, core.getAccessRule(name) || core.ensureAccessRule(name));
+  }
+  if (req.method === 'POST' && u.pathname.match(/^\/api\/access-rules\/[^/]+\/(block|unblock)$/)) {
+    const parts = u.pathname.split('/');
+    const name = decodeURIComponent(parts[3]);
+    const action = parts[4];
+    const body = JSON.parse((await readBody(req)) || '{}');
+    const rule = core.setAccessRule(name, {
+      direct: action === 'block' ? 'blocked' : 'unblocked',
+      by: body.by || 'dashboard',
+      source: body.source || 'dashboard'
+    });
+    return send(res, 200, rule);
+  }
+  if (req.method === 'POST' && u.pathname.match(/^\/api\/access-rules\/[^/]+\/notify$/)) {
+    const name = decodeURIComponent(u.pathname.split('/')[3]);
+    const rule = core.getAccessRule(name) || core.ensureAccessRule(name);
+    const r = await slack.notifyAccessRule(rule, { dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined });
+    return send(res, r.ok ? 200 : 500, r.ok ? r : { error: r.error });
+  }
   if (req.method === 'GET' && u.pathname === '/api/discovered-clis') {
     const scanner = require('./scanner');
     const gates = Object.fromEntries(core.listGates().map(g => [g.name, g]));
@@ -273,6 +298,20 @@ const server = http.createServer(async (req, res) => {
     if (!okSig) return send(res, 401, { error: 'bad_signature' });
     const payload = JSON.parse(querystring.parse(raw).payload || '{}');
     const action = (payload.actions || [])[0] || {};
+    if (action.action_id === 'access_block' || action.action_id === 'access_unblock') {
+      const who = '@' + ((payload.user && payload.user.username) || 'slack');
+      const rule = core.setAccessRule(action.value || 'railway', {
+        direct: action.action_id === 'access_block' ? 'blocked' : 'unblocked',
+        by: who,
+        source: 'slack'
+      });
+      const target = payload.response_url ? { responseUrl: payload.response_url } : {};
+      if (target.responseUrl) {
+        slack.updateAccessRule(target, rule, who, { dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined })
+          .catch(e => process.stderr.write(`slack.updateAccessRule failed: ${e.message}\n`));
+      }
+      return send(res, 200, '');
+    }
     const status = action.action_id === 'allow' ? 'approved' : 'denied';
     const who = '@' + ((payload.user && payload.user.username) || 'slack');
     const before = ap.getApproval(action.value);

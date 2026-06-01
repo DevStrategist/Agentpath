@@ -3,6 +3,8 @@ const crypto = require('crypto');
 const { load, update } = require('./store');
 const SECRET = process.env.KEYRING_SIGNING_SECRET || 'dev-insecure-secret';
 const now = () => Date.now();
+const VALID_DIRECT = new Set(['blocked', 'unblocked']);
+const VALID_PROXY = new Set(['requires_approval', 'allowed', 'denied']);
 
 function sign(g) {
   return crypto.createHmac('sha256', SECRET)
@@ -145,6 +147,72 @@ function updateGate(name, patch) {
   });
 }
 
+// --- access rules (demo-friendly controls for direct CLI egress) ---
+function ensureAccessRule(cli, opts = {}) {
+  return update(s => {
+    if (!s.accessRules) s.accessRules = {};
+    if (!s.accessRules[cli]) {
+      s.accessRules[cli] = {
+        cli,
+        enforcement: opts.enforcement || 'real',
+        direct: opts.direct || 'blocked',
+        proxy: opts.proxy || 'requires_approval',
+        hosts: opts.hosts || defaultAllowHostsForGatedClis([cli]),
+        lastChangedBy: opts.by || 'system',
+        lastChangedSource: opts.source || 'system',
+        updatedAt: now()
+      };
+    }
+    return s.accessRules[cli];
+  });
+}
+function getAccessRule(cli) {
+  return (load().accessRules || {})[cli] || null;
+}
+function listAccessRules() {
+  return Object.values(load().accessRules || {});
+}
+function setAccessRule(cli, patch = {}) {
+  if (patch.direct && !VALID_DIRECT.has(patch.direct)) throw new Error('invalid_direct_access_state');
+  if (patch.proxy && !VALID_PROXY.has(patch.proxy)) throw new Error('invalid_proxy_access_state');
+  return update(s => {
+    if (!s.accessRules) s.accessRules = {};
+    const prev = s.accessRules[cli] || {
+      cli,
+      enforcement: 'real',
+      direct: 'blocked',
+      proxy: 'requires_approval',
+      hosts: defaultAllowHostsForGatedClis([cli])
+    };
+    const next = {
+      ...prev,
+      enforcement: patch.enforcement || prev.enforcement,
+      direct: patch.direct || prev.direct,
+      proxy: patch.proxy || prev.proxy,
+      hosts: patch.hosts || prev.hosts,
+      lastChangedBy: patch.by || 'unknown',
+      lastChangedSource: patch.source || 'unknown',
+      updatedAt: now()
+    };
+    s.accessRules[cli] = next;
+    if (!s.audit) s.audit = [];
+    if (patch.direct && patch.direct !== prev.direct) {
+      s.audit.push({
+        ts: Date.now(),
+        taskId: patch.taskId || null,
+        host: null,
+        cli,
+        decision: patch.direct === 'blocked' ? 'blocked' : 'unblocked',
+        reason: patch.direct === 'blocked' ? 'direct_access_blocked' : 'direct_access_unblocked',
+        approver: patch.by || 'unknown',
+        source: patch.source || 'unknown'
+      });
+      if (s.audit.length > 500) s.audit = s.audit.slice(-500);
+    }
+    return next;
+  });
+}
+
 // --- audit ---
 function addAudit(ev) {
   return update(s => {
@@ -164,5 +232,6 @@ module.exports = {
   hostAllowed, isSubset, coveredBy,
   addGate, listGates, getGate, removeGate, updateGate,
   defaultAllowHostsForGatedClis,
+  ensureAccessRule, getAccessRule, listAccessRules, setAccessRule,
   addAudit, getAudit
 };

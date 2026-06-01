@@ -5,6 +5,7 @@
   "bin": { "keyring": "bin/keyring" },
   "scripts": {
     "demo": "bash demo/run-demo.sh",
+    "demo:railway:preflight": "bash demo/run-railway-demo-preflight.sh",
     "test": "node test/core.test.js",
     "serve": "node bin/keyring serve",
     "start": "node bin/keyring serve"

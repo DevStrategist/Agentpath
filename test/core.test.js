@@ -1,6 +1,7 @@
 // Minimal assertions for the moat: attenuation + task-binding + scope.
 process.env.KEYRING_STATE = '/tmp/keyring-test-' + Date.now() + '.json';
 const core = require('../src/core');
+const slack = require('../src/slack');
 let pass = 0, fail = 0;
 const ok = (name, cond) => { if (cond) { pass++; console.log('  PASS', name); } else { fail++; console.log('  FAIL', name); } };
 
@@ -50,6 +51,47 @@ ok('gate remove deletes', (() => {
 ok('gate remove missing throws', (() => {
   try { core.removeGate('not-a-thing'); return false; }
   catch (e) { return e.message === 'gate_not_found'; }
+})());
+
+ok('access rule defaults to blocked railway real mode', (() => {
+  const rule = core.ensureAccessRule('railway');
+  return rule.cli === 'railway' &&
+    rule.enforcement === 'real' &&
+    rule.direct === 'blocked' &&
+    rule.proxy === 'requires_approval';
+})());
+ok('access unblock records actor and audit', (() => {
+  const before = core.getAudit().length;
+  const rule = core.setAccessRule('railway', { direct: 'unblocked', by: 'test-user', source: 'unit' });
+  const audit = core.getAudit().slice(before);
+  return rule.direct === 'unblocked' &&
+    rule.lastChangedBy === 'test-user' &&
+    audit.some(e => e.reason === 'direct_access_unblocked' && e.cli === 'railway');
+})());
+ok('access block records actor and audit', (() => {
+  const rule = core.setAccessRule('railway', { direct: 'blocked', by: 'test-user', source: 'unit' });
+  const latest = core.getAudit().slice(-1)[0];
+  return rule.direct === 'blocked' &&
+    latest.reason === 'direct_access_blocked' &&
+    latest.decision === 'blocked';
+})());
+ok('access rule rejects invalid direct state', (() => {
+  try { core.setAccessRule('railway', { direct: 'open' }); return false; }
+  catch (e) { return e.message === 'invalid_direct_access_state'; }
+})());
+ok('access rule can be set to simulated mode', (() => {
+  const rule = core.setAccessRule('railway', { enforcement: 'simulated', direct: 'blocked', by: 'unit', source: 'test' });
+  return rule.enforcement === 'simulated' && rule.direct === 'blocked';
+})());
+ok('slack access blocks include block and unblock actions', (() => {
+  const blocks = slack.accessRuleBlocks({ cli: 'railway', direct: 'blocked', enforcement: 'real' }, { dashboardUrl: 'http://localhost:3000' });
+  const actions = blocks.flatMap(b => b.elements || []).map(e => e.action_id).filter(Boolean);
+  return actions.includes('access_block') && actions.includes('access_unblock');
+})());
+ok('blocked access rule is visible to proxy checks', (() => {
+  core.setAccessRule('railway', { direct: 'blocked', by: 'unit', source: 'test' });
+  const rule = core.getAccessRule('railway');
+  return rule.direct === 'blocked' && rule.proxy === 'requires_approval';
 })());
 
 setTimeout(() => {

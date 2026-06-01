@@ -12,6 +12,11 @@ const TIMEOUT = parseInt(process.env.KEYRING_APPROVAL_TIMEOUT || '60000', 10);
 const AUTO = process.env.KEYRING_AUTO_APPROVE === '1';
 const PORT = parseInt(process.env.KEYRING_PROXY_PORT || '8080', 10);
 
+function inferCli(host, headers = {}) {
+  if (headers['x-keyring-cli']) return headers['x-keyring-cli'];
+  return host === 'railway.com' || host.endsWith('.railway.com') ? 'railway' : undefined;
+}
+
 function refuse(sock, code, reason) {
   try { sock.write(`HTTP/1.1 ${code} ${reason}\r\n\r\n`); } catch (e) {}
   sock.destroy();
@@ -26,6 +31,8 @@ server.on('connect', async (req, clientSocket, head) => {
   const [host, portStr] = req.url.split(':');
   const port = parseInt(portStr || '443', 10);
   const taskId = TASK;
+  const cli = inferCli(host, req.headers);
+  const accessRule = cli ? (core.getAccessRule(cli) || core.ensureAccessRule(cli)) : null;
 
   // 1) task-binding: task must be active (catches cancelled/expired even if previously approved)
   const task = core.getTask(taskId);
@@ -44,6 +51,10 @@ server.on('connect', async (req, clientSocket, head) => {
     core.addAudit({ taskId, host, decision: 'denied', reason: 'host_not_in_scope' });
     return refuse(clientSocket, 403, 'Host Not In Scope');
   }
+  if (accessRule && accessRule.proxy === 'denied') {
+    core.addAudit({ taskId, host, decision: 'denied', reason: 'railway_access_disabled', cli, accessDirect: accessRule.direct });
+    return refuse(clientSocket, 403, 'Railway Access Disabled');
+  }
   // 4) human approval, cached per (task, host)
   let appr = ap.findApproval(taskId, host);
   if (appr && appr.status === 'denied') {
@@ -56,7 +67,8 @@ server.on('connect', async (req, clientSocket, head) => {
     // Build rich context once so Slack and stderr both have it.
     const recent = core.getAudit(taskId);
     const ctx = {
-      cli: req.headers['x-keyring-cli'] || undefined,           // optional hint from `keyring run`
+      cli,
+      accessRule,
       invoker: process.env.SUDO_USER || process.env.USER || undefined,
       allowHosts: grant.allowHosts,
       recentApproved: recent.filter(e => e.decision === 'allowed').length,

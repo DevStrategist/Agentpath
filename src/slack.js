@@ -28,6 +28,9 @@ function approvalBlocks(pending, ctx = {}) {
     { type: 'mrkdwn', text: `*Invoked by* ${invoker} · *via* ${cli}` },
     { type: 'mrkdwn', text: recentLine }
   ];
+  if (ctx.accessRule) {
+    elements.push({ type: 'mrkdwn', text: `*Direct ${ctx.accessRule.cli} access* \`${ctx.accessRule.direct}\` · *Proxy* \`${ctx.accessRule.proxy}\`` });
+  }
   if (ctx.dashboardUrl) {
     elements.push({ type: 'mrkdwn', text: `<${ctx.dashboardUrl}|Open dashboard>` });
   }
@@ -55,6 +58,33 @@ function resolvedBlocks(pending, status, approver, ctx = {}) {
       text: `${word} ${cli} → *${pending.host}* (task *${pending.taskId}*).` } },
     { type: 'context', elements: [
       { type: 'mrkdwn', text: `${icon} ${word} by *${approver || 'unknown'}* · ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC` }
+    ]}
+  ];
+}
+
+function accessRuleBlocks(rule, ctx = {}) {
+  const direct = rule.direct === 'blocked' ? 'blocked' : 'unblocked';
+  const icon = direct === 'blocked' ? '⛔' : '✅';
+  const mode = rule.enforcement || 'real';
+  const changedBy = rule.lastChangedBy ? `Last changed by \`${rule.lastChangedBy}\`` : 'No changes recorded yet';
+  const elements = [
+    { type: 'mrkdwn', text: `*CLI* \`${rule.cli}\` · *Direct access* \`${direct}\`` },
+    { type: 'mrkdwn', text: `*Enforcement* \`${mode}\` · *Proxy* \`${rule.proxy || 'requires_approval'}\`` },
+    { type: 'mrkdwn', text: changedBy }
+  ];
+  if (ctx.dashboardUrl) {
+    elements.push({ type: 'mrkdwn', text: `<${ctx.dashboardUrl}|Open dashboard>` });
+  }
+  return [
+    { type: 'header', text: { type: 'plain_text', text: `${icon} KEYRING Railway access` } },
+    { type: 'section', text: { type: 'mrkdwn',
+      text: direct === 'blocked'
+        ? `Direct \`${rule.cli}\` network access is *blocked*. The agent must use KEYRING as the proxy.`
+        : `Direct \`${rule.cli}\` network access is *unblocked*. Block it before running the protected demo path.` } },
+    { type: 'context', elements },
+    { type: 'actions', elements: [
+      { type: 'button', style: 'danger', text: { type: 'plain_text', text: 'Block Direct Railway' }, action_id: 'access_block', value: rule.cli },
+      { type: 'button', style: 'primary', text: { type: 'plain_text', text: 'Unblock Direct Railway' }, action_id: 'access_unblock', value: rule.cli }
     ]}
   ];
 }
@@ -146,6 +176,19 @@ async function notify(pending, ctx = {}) {
   return { ok: true, channel: r.body.channel, ts: r.body.ts };
 }
 
+async function notifyAccessRule(rule, ctx = {}) {
+  if (!isEnabled()) return { ok: false, error: 'slack_disabled' };
+  const channel = process.env.SLACK_APPROVAL_CHANNEL;
+  if (!channel) return { ok: false, error: 'channel_unset' };
+  const r = await withRetry(() => postJson('/api/chat.postMessage', {
+    channel,
+    text: `KEYRING ${rule.cli} direct access is ${rule.direct}`,
+    blocks: accessRuleBlocks(rule, ctx)
+  }));
+  if (!r.body || !r.body.ok) return { ok: false, error: (r.body && r.body.error) || 'http_' + r.status };
+  return { ok: true, channel: r.body.channel, ts: r.body.ts };
+}
+
 // Edits the approval message to remove buttons and show the outcome.
 // Pass either { channel, ts } (chat.update path) or { responseUrl } (faster, no auth needed —
 // Slack gives us this on interactivity callbacks).
@@ -154,6 +197,25 @@ async function update(target, pending, status, approver, ctx = {}) {
   const payload = {
     text: `${status === 'approved' ? '✅ Allowed' : '⛔ Denied'} ${pending.host} for ${pending.taskId} by ${approver || 'unknown'}`,
     blocks: resolvedBlocks(pending, status, approver, ctx),
+    replace_original: true
+  };
+  if (target.responseUrl) {
+    const r = await postUrl(target.responseUrl, payload).catch(e => ({ status: 0, body: e.message }));
+    return { ok: r.status === 200, error: r.status !== 200 ? ('response_url_' + r.status) : undefined };
+  }
+  const r = await withRetry(() => postJson('/api/chat.update', {
+    channel: target.channel, ts: target.ts,
+    text: payload.text, blocks: payload.blocks
+  }));
+  if (!r.body || !r.body.ok) return { ok: false, error: (r.body && r.body.error) || 'http_' + r.status };
+  return { ok: true };
+}
+
+async function updateAccessRule(target, rule, actor, ctx = {}) {
+  if (!isEnabled() && !target.responseUrl) return { ok: false, error: 'slack_disabled' };
+  const payload = {
+    text: `KEYRING ${rule.cli} direct access is ${rule.direct} by ${actor || 'unknown'}`,
+    blocks: accessRuleBlocks(rule, { ...ctx, actor }),
     replace_original: true
   };
   if (target.responseUrl) {
@@ -195,6 +257,6 @@ function verifySignature(rawBody, timestamp, signature) {
 }
 
 module.exports = {
-  notify, update, test, verifySignature, isEnabled,
-  approvalBlocks, resolvedBlocks // exported for tests
+  notify, notifyAccessRule, update, updateAccessRule, test, verifySignature, isEnabled,
+  approvalBlocks, resolvedBlocks, accessRuleBlocks // exported for tests
 };

@@ -128,6 +128,24 @@ switch (cmd) {
     }
     break;
   }
+  case 'access': {
+    const cli = flags.cli || flags.name || 'railway';
+    if (sub === 'show') {
+      ok(core.getAccessRule(cli) || core.ensureAccessRule(cli));
+    } else if (sub === 'list') {
+      ok(core.listAccessRules());
+    } else if (sub === 'block') {
+      ok(core.setAccessRule(cli, { direct: 'blocked', by: flags.by || process.env.USER || 'cli', source: 'cli' }));
+    } else if (sub === 'unblock') {
+      ok(core.setAccessRule(cli, { direct: 'unblocked', by: flags.by || process.env.USER || 'cli', source: 'cli' }));
+    } else if (sub === 'mode') {
+      if (!flags.enforcement || !['real', 'simulated'].includes(flags.enforcement)) die('usage: keyring access mode --cli railway --enforcement real|simulated');
+      ok(core.setAccessRule(cli, { enforcement: flags.enforcement, by: flags.by || process.env.USER || 'cli', source: 'cli' }));
+    } else {
+      die('usage: keyring access show|list|block|unblock|mode --cli <name>');
+    }
+    break;
+  }
   case 'gate': {
     if (sub === 'add') {
       if (!flags.name) die('usage: keyring gate add --name <cli> [--bin <path>] [--config-paths a,b]');
@@ -263,6 +281,13 @@ switch (cmd) {
       '  task cancel --id <id>                 cancel a task (voids its grant + approvals)',
       '  grant --task <id> --allow a,b         set the host allowlist (root grant)',
       '  derive --task <id> --allow a          narrow the grant (rejects widening)',
+      '',
+      'access controls:',
+      '  access show --cli railway              show one access rule',
+      '  access list                            list access rules',
+      '  access block --cli railway             block direct CLI egress',
+      '  access unblock --cli railway           unblock direct CLI egress',
+      '  access mode --cli railway --enforcement real|simulated',
       '',
       'gated CLIs (per-binary universal mode — silent after install):',
       '  gate add --name <cli> [--bin <path>]  register a CLI to gate (no system change)',
