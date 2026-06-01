@@ -1,5 +1,6 @@
 // Audit + approval HTTP server, the Slack interactivity endpoint, and a tiny dashboard.
 // Deploy this (e.g. Vercel/Fly/Render) so Slack can reach /api/slack/interactivity.
+require('./env').loadDotEnv();
 const http = require('http');
 const fs = require('fs');
 const path = require('path');

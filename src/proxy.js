@@ -1,6 +1,7 @@
 // The heart of option 1: an HTTP CONNECT proxy that gates by DESTINATION HOST.
 // It never decrypts traffic — it sees only host:port from the CONNECT line, then allows or
 // refuses the tunnel based on the task's grant (host allowlist), task status, and human approval.
+require('./env').loadDotEnv();
 const http = require('http');
 const net = require('net');
 const core = require('./core');

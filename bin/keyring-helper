@@ -171,11 +171,26 @@ case "$verb" in
     state_file="${KEYRING_STATE:-/var/lib/keyring/state.json}"
     touch "$state_file" 2>/dev/null || true
     chmod 666 "$state_file" 2>/dev/null || true
+    if [[ -f /var/lib/keyring/proxy.env ]]; then
+      set -a
+      # shellcheck disable=SC1091
+      . /var/lib/keyring/proxy.env
+      set +a
+    fi
+    proxy_env=(
+      "KEYRING_PROXY_PORT=$port"
+      "KEYRING_TASK=$task"
+      "KEYRING_STATE=$state_file"
+    )
+    [[ -n "${SLACK_BOT_TOKEN:-}" ]] && proxy_env+=("SLACK_BOT_TOKEN=$SLACK_BOT_TOKEN")
+    [[ -n "${SLACK_SIGNING_SECRET:-}" ]] && proxy_env+=("SLACK_SIGNING_SECRET=$SLACK_SIGNING_SECRET")
+    [[ -n "${SLACK_APPROVAL_CHANNEL:-}" ]] && proxy_env+=("SLACK_APPROVAL_CHANNEL=$SLACK_APPROVAL_CHANNEL")
+    [[ -n "${KEYRING_DASHBOARD_URL:-}" ]] && proxy_env+=("KEYRING_DASHBOARD_URL=$KEYRING_DASHBOARD_URL")
     # Spawn as keyring-proxy uid, fully detached, stdio to log
     touch "$PROXY_LOG_FILE" 2>/dev/null || true
     chown "$PROXY_USER:$PROXY_GROUP" "$PROXY_LOG_FILE" 2>/dev/null || true
     nohup sudo -u "$PROXY_USER" \
-      env KEYRING_PROXY_PORT="$port" KEYRING_TASK="$task" KEYRING_STATE="$state_file" \
+      env "${proxy_env[@]}" \
       "$node_bin" "$repo/bin/keyring" proxy --task "$task" --port "$port" \
       >> "$PROXY_LOG_FILE" 2>&1 &
     new_pid=$!

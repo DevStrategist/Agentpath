@@ -131,6 +131,12 @@ echo "    bundled:     /usr/local/lib/keyring/ (so keyring-proxy uid can load th
 install -d -m 777 /var/lib/keyring   # not sticky — both axiom and keyring-proxy
                                       # need to rename/replace files in here
 echo "    state dir:   /var/lib/keyring (777, shared between axiom + keyring-proxy)"
+if [[ -f "$REPO_DIR/.env" ]]; then
+  grep -E '^(SLACK_BOT_TOKEN|SLACK_SIGNING_SECRET|SLACK_APPROVAL_CHANNEL|KEYRING_DASHBOARD_URL)=' "$REPO_DIR/.env" > /var/lib/keyring/proxy.env || true
+  chown root:wheel /var/lib/keyring/proxy.env 2>/dev/null || true
+  chmod 600 /var/lib/keyring/proxy.env 2>/dev/null || true
+  echo "    proxy env:   /var/lib/keyring/proxy.env (Slack settings copied from .env)"
+fi
 # Migrate any pre-existing state from the repo dir on first install
 if [[ -f "$REPO_DIR/.keyring-state.json" && ! -f /var/lib/keyring/state.json ]]; then
   cp "$REPO_DIR/.keyring-state.json" /var/lib/keyring/state.json

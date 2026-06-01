@@ -3,6 +3,7 @@ process.env.KEYRING_STATE = '/tmp/keyring-test-' + Date.now() + '.json';
 const core = require('../src/core');
 const slack = require('../src/slack');
 const invoker = require('../src/invoker');
+const env = require('../src/env');
 let pass = 0, fail = 0;
 const ok = (name, cond) => { if (cond) { pass++; console.log('  PASS', name); } else { fail++; console.log('  FAIL', name); } };
 
@@ -124,6 +125,17 @@ ok('install wrapper skips nested sudo when already root', (() => {
   return invocation.cmd === 'bash' &&
     invocation.args[0] === '/tmp/bootstrap.sh' &&
     invocation.env.SUDO_USER === 'axiom';
+})());
+ok('env parser reads simple dotenv keys without comments', (() => {
+  const parsed = env.parseDotEnv('SLACK_BOT_TOKEN=xoxb-test\n# comment\nSLACK_APPROVAL_CHANNEL=C123\nEMPTY=\n');
+  return parsed.SLACK_BOT_TOKEN === 'xoxb-test' &&
+    parsed.SLACK_APPROVAL_CHANNEL === 'C123' &&
+    parsed.EMPTY === '';
+})());
+ok('env parser strips matching quotes', (() => {
+  const parsed = env.parseDotEnv("KEYRING_DASHBOARD_URL=\"https://example.com\"\nSLACK_SIGNING_SECRET='abc'\n");
+  return parsed.KEYRING_DASHBOARD_URL === 'https://example.com' &&
+    parsed.SLACK_SIGNING_SECRET === 'abc';
 })());
 
 setTimeout(() => {

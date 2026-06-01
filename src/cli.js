@@ -5,6 +5,7 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const { resolveInvokingUser, bootstrapInvocation } = require('./invoker');
+require('./env').loadDotEnv();
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
