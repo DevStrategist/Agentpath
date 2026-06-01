@@ -5,10 +5,10 @@ const { load, update } = require('./store');
 function findApproval(taskId, host) {
   return Object.values(load().approvals).find(a => a.taskId === taskId && a.host === host);
 }
-function createPending(taskId, host) {
+function createPending(taskId, host, meta = {}) {
   return update(s => {
     const id = 'ap_' + crypto.randomBytes(4).toString('hex');
-    s.approvals[id] = { id, taskId, host, status: 'pending', ts: Date.now() };
+    s.approvals[id] = { id, taskId, host, status: 'pending', ts: Date.now(), ...meta };
     return s.approvals[id];
   });
 }

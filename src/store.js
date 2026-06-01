@@ -14,7 +14,7 @@ function pickStatePath() {
 const STATE = pickStatePath();
 function load() {
   try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); }
-  catch (e) { return { tasks: {}, grants: {}, approvals: {}, audit: [], gatedClis: {} }; }
+  catch (e) { return { tasks: {}, grants: {}, approvals: {}, audit: [], gatedClis: {}, accessRules: {} }; }
 }
 function save(s) {
   const tmp = STATE + '.tmp';

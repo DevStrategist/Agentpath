@@ -1,313 +1,1243 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>KEYRING — audit</title>
-<style>
-  :root{--bg:#0b0e14;--card:#141925;--line:#232a3a;--ink:#e6eaf2;--mut:#8a93a6;--ok:#1f9d57;--no:#d6455b;--acc:#5b8cff}
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-  header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:12px}
-  h1{font:600 16px/1 system-ui;margin:0;letter-spacing:.5px} .sub{color:var(--mut);font:12px/1 system-ui}
-  main{padding:20px 24px;max-width:980px;margin:0 auto} .grid{display:grid;gap:18px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
-  .card h2{font:600 12px/1 system-ui;letter-spacing:1px;text-transform:uppercase;color:var(--mut);margin:0;padding:12px 16px;border-bottom:1px solid var(--line)}
-  table{width:100%;border-collapse:collapse} td,th{padding:9px 16px;text-align:left;border-bottom:1px solid var(--line)}
-  th{color:var(--mut);font:600 11px/1 system-ui;letter-spacing:.5px} tr:last-child td{border-bottom:0}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font:600 11px/1.6 system-ui}
-  .allowed{background:rgba(31,157,87,.16);color:#5fe39a} .denied{background:rgba(214,69,91,.16);color:#ff8a99}
-  .reason{color:var(--mut)} .host{color:var(--ink)} .by{color:var(--acc)}
-  .btn{cursor:pointer;border:1px solid var(--line);background:#1b2230;color:var(--ink);border-radius:7px;padding:5px 11px;font:600 12px/1 system-ui;margin-right:6px}
-  .btn.allow{border-color:#1f9d57;color:#5fe39a} .btn.deny{border-color:#d6455b;color:#ff8a99}
-  .empty{padding:16px;color:var(--mut)}
-</style></head><body>
-<header>
-  <h1>KEYRING</h1>
-  <span class="sub">policy egress proxy · live audit</span>
-  <span id="jailbadge" style="margin-left:auto" class="sub">jail: ?</span>
-</header>
-<main class="grid">
-  <div class="card" id="jail-card" style="display:none">
-    <h2>Privileged helper</h2>
-    <div id="jail-state" style="padding:12px 16px"></div>
-  </div>
-  <div class="card" id="proxy-card" style="display:none">
-    <h2>Egress proxy <span id="proxy-meta" class="sub" style="margin-left:8px;font-weight:normal"></span></h2>
-    <div id="proxy-state" style="padding:12px 16px"></div>
-  </div>
-  <div class="card">
-    <h2>Discovered CLIs <span id="disc-meta" class="sub" style="margin-left:8px;font-weight:normal"></span></h2>
-    <div style="padding:10px 16px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <input id="d-filter" placeholder="filter…" style="background:#0b0e14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:6px 10px;font:13px ui-monospace,monospace;flex:1;min-width:120px" oninput="renderDiscovered()"/>
-      <label class="sub" style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
-        <input id="d-onlygated" type="checkbox" oninput="renderDiscovered()"/> only enabled
-      </label>
-    </div>
-    <div id="discovered" style="max-height:340px;overflow:auto"><div class="empty">scanning…</div></div>
-  </div>
-  <div class="card">
-    <h2>Manually registered gates</h2>
-    <div id="gates"><div class="empty">none</div></div>
-    <div style="padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <input id="g-name" placeholder="cli name (e.g. railway)" style="background:#0b0e14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:6px 10px;font:13px ui-monospace,monospace;flex:1;min-width:120px"/>
-      <input id="g-bin" placeholder="optional --bin path" style="background:#0b0e14;border:1px solid var(--line);color:var(--ink);border-radius:6px;padding:6px 10px;font:13px ui-monospace,monospace;flex:2;min-width:160px"/>
-      <button class="btn allow" onclick="addGate()">Register</button>
-    </div>
-  </div>
-  <div class="card"><h2>Pending approvals</h2><div id="pending"><div class="empty">none</div></div></div>
-  <div class="card"><h2>Audit trail</h2><table><thead><tr><th>time</th><th>cli</th><th>host</th><th>decision</th><th>reason</th><th>approver</th></tr></thead><tbody id="audit"></tbody></table></div>
-</main>
-<script>
-async function j(u,o){const r=await fetch(u,o);return r.json()}
-function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
-let discoveredCache = { items: [], host: '', count: 0, gatedCount: 0 };
-let recentlyToggled = new Map(); // name -> timestamp, used to flash the row briefly
-function renderDiscovered(){
-  const filter = (document.getElementById('d-filter').value || '').trim().toLowerCase();
-  const onlyGated = document.getElementById('d-onlygated').checked;
-  const items = discoveredCache.items
-    .filter(i =>
-      (!filter || i.name.toLowerCase().includes(filter) || (i.path||'').toLowerCase().includes(filter)) &&
-      (!onlyGated || i.gated))
-    .sort((a, b) => (b.gated - a.gated) || a.name.localeCompare(b.name)); // gated to the top
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KEYRING</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Sora:wght@500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: oklch(97% 0.009 165);
+      --surface: oklch(99.5% 0.004 165);
+      --surface-2: oklch(94.5% 0.013 165);
+      --ink: oklch(21% 0.022 145);
+      --muted: oklch(48% 0.024 145);
+      --line: oklch(84% 0.018 165);
+      --strong-line: oklch(68% 0.032 155);
+      --brand: oklch(44% 0.115 158);
+      --brand-soft: oklch(93% 0.04 158);
+      --danger: oklch(52% 0.18 25);
+      --danger-soft: oklch(94% 0.04 25);
+      --warn: oklch(58% 0.13 62);
+      --warn-soft: oklch(94% 0.055 62);
+      --info: oklch(45% 0.11 252);
+      --info-soft: oklch(93% 0.035 252);
+      --violet: oklch(48% 0.12 305);
+      --violet-soft: oklch(94% 0.035 305);
+      --space-2xs: 4px;
+      --space-xs: 8px;
+      --space-sm: 12px;
+      --space-md: 16px;
+      --space-lg: 24px;
+      --space-xl: 32px;
+      --space-2xl: 48px;
+      --radius: 8px;
+      --shadow: 0 18px 52px color-mix(in oklch, var(--ink) 10%, transparent);
+      --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      --body: Figtree, "Segoe UI", sans-serif;
+      --display: Sora, Figtree, sans-serif;
+    }
 
-  document.getElementById('disc-meta').textContent =
-    `${discoveredCache.gatedCount} of ${discoveredCache.count} enabled · scanned on ${discoveredCache.host}`;
+    * { box-sizing: border-box; }
+    html { min-width: 320px; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font: 14px/1.45 var(--body);
+    }
 
-  const now = Date.now();
-  document.getElementById('discovered').innerHTML = items.length ? items.map(i => {
-    const flashUntil = recentlyToggled.get(i.name) || 0;
-    const flashing = flashUntil > now;
-    const bg = flashing ? 'background:rgba(31,157,87,.18);transition:background .8s' : '';
-    return `<div data-cli="${esc(i.name)}" style="padding:8px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:12px;${bg}">
-      <div style="flex:1;min-width:0;overflow:hidden">
-        <div style="display:flex;gap:10px;align-items:center">
-          <span class="host" style="font-weight:600">${esc(i.name)}</span>
-          ${i.gated ? `<span class="pill ${i.enforcement==='shimmed'?'allowed':'denied'}" style="font-size:10px">${esc(i.enforcement||'on')}</span>` : ''}
+    button, input { font: inherit; }
+    button {
+      min-height: 36px;
+      border: 1px solid var(--strong-line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--ink);
+      cursor: pointer;
+      font-weight: 700;
+      padding: 0 var(--space-md);
+      transition: transform 120ms ease, background 120ms ease, border-color 120ms ease;
+    }
+    button:hover:not(:disabled) { transform: translateY(-1px); border-color: var(--ink); }
+    button:disabled { cursor: not-allowed; opacity: .48; }
+    button.primary { background: var(--brand); border-color: var(--brand); color: oklch(98% 0.01 158); }
+    button.danger { background: var(--danger); border-color: var(--danger); color: oklch(98% 0.01 25); }
+    button.warn { background: var(--warn-soft); border-color: var(--warn); color: oklch(32% 0.08 62); }
+    button.ghost { background: transparent; }
+    input {
+      min-height: 38px;
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      color: var(--ink);
+      padding: 0 var(--space-sm);
+    }
+    input:focus, button:focus-visible {
+      outline: 3px solid color-mix(in oklch, var(--brand) 20%, transparent);
+      outline-offset: 2px;
+    }
+
+    .shell { min-height: 100vh; }
+    .topbar {
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .topbar-inner {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: var(--lg-pad, 20px) var(--space-lg);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-md);
+    }
+    .brand { display: grid; gap: var(--space-2xs); }
+    h1 {
+      margin: 0;
+      font: 700 1.5rem/1.05 var(--display);
+      letter-spacing: 0;
+    }
+    .tagline { color: var(--muted); max-width: 68ch; }
+    .page {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: var(--space-xl) var(--space-lg) var(--space-2xl);
+      display: grid;
+      gap: var(--space-lg);
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, .78fr) minmax(320px, .42fr);
+      align-items: start;
+      gap: var(--space-lg);
+      padding-bottom: var(--space-md);
+      border-bottom: 1px solid var(--line);
+    }
+    .hero h2 {
+      margin: 0 0 var(--space-xs);
+      font: 700 2rem/1.08 var(--display);
+      letter-spacing: 0;
+    }
+    .hero p { margin: 0; color: var(--muted); max-width: 62ch; }
+    .hero-panel {
+      justify-self: end;
+      width: min(100%, 380px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      padding: var(--space-md);
+      display: grid;
+      gap: var(--space-sm);
+    }
+    .hero-panel-title {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-sm);
+      align-items: center;
+      font-weight: 800;
+    }
+    .hero-panel p { font-size: .9rem; }
+    .refresh { display: flex; align-items: center; justify-content: space-between; gap: var(--space-xs); color: var(--muted); font-size: .85rem; }
+
+    .flow-shell {
+      position: relative;
+      overflow: visible;
+      border-radius: 0;
+      background: transparent;
+    }
+    .flow-head {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-md);
+      align-items: end;
+      padding: var(--space-sm) 0 0;
+    }
+    .flow-head h3 {
+      font-size: 1.35rem;
+    }
+    .flow-head p {
+      margin: var(--space-2xs) 0 0;
+      color: var(--muted);
+      max-width: 68ch;
+    }
+    .flow-head > .badge {
+      justify-self: start;
+      width: max-content;
+      max-width: 100%;
+    }
+    .flow-board {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: 1fr .92fr 1fr;
+      gap: var(--space-lg);
+      padding: var(--space-xl) var(--space-lg) var(--space-lg);
+      min-height: 420px;
+      isolation: isolate;
+    }
+    .flow-board::before {
+      content: "";
+      position: absolute;
+      inset: 54px 0 36px;
+      z-index: -1;
+      background:
+        radial-gradient(ellipse at 18% 44%, color-mix(in oklch, var(--brand-soft) 58%, transparent) 0 22%, transparent 48%),
+        radial-gradient(ellipse at 84% 35%, color-mix(in oklch, var(--violet-soft) 42%, transparent) 0 18%, transparent 46%);
+      filter: blur(18px);
+      opacity: .72;
+    }
+    .flow-lines {
+      position: absolute;
+      inset: 84px 0 var(--space-lg);
+      width: 100%;
+      height: calc(100% - 108px);
+      pointer-events: none;
+      z-index: 0;
+    }
+    .flow-line {
+      fill: none;
+      stroke: color-mix(in oklch, var(--brand) 48%, var(--line));
+      stroke-width: 2.2;
+      stroke-linecap: round;
+      stroke-dasharray: 10 11;
+      animation: route 1.8s linear infinite;
+    }
+    .flow-line.muted {
+      stroke: color-mix(in oklch, var(--muted) 36%, var(--line));
+      stroke-dasharray: none;
+      animation: none;
+    }
+    .flow-line.danger {
+      stroke: color-mix(in oklch, var(--danger) 70%, var(--line));
+      stroke-dasharray: 4 8;
+    }
+    @keyframes route {
+      to { stroke-dashoffset: -42; }
+    }
+    .flow-column {
+      display: grid;
+      align-content: start;
+      gap: var(--space-sm);
+      min-width: 0;
+    }
+    .flow-label {
+      color: var(--muted);
+      font-size: .72rem;
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .flow-node {
+      border: 1px solid color-mix(in oklch, var(--line) 72%, var(--surface));
+      border-radius: var(--radius);
+      background: color-mix(in oklch, var(--surface) 86%, transparent);
+      backdrop-filter: blur(10px);
+      padding: var(--space-sm);
+      display: grid;
+      gap: var(--space-xs);
+      box-shadow: 0 10px 30px color-mix(in oklch, var(--ink) 7%, transparent);
+    }
+    .flow-node.strong {
+      background: color-mix(in oklch, var(--surface) 94%, var(--brand-soft));
+      color: var(--ink);
+      border-color: color-mix(in oklch, var(--brand) 34%, var(--line));
+      min-height: 232px;
+      align-content: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .flow-node.strong::after {
+      content: "";
+      position: absolute;
+      inset: -80px -70px auto auto;
+      width: 180px;
+      height: 180px;
+      background: color-mix(in oklch, var(--brand-soft) 72%, transparent);
+      border-radius: 999px;
+      filter: blur(18px);
+      opacity: .8;
+    }
+    .flow-node.warn-node {
+      border-color: color-mix(in oklch, var(--danger) 45%, var(--line));
+      background: color-mix(in oklch, var(--danger-soft) 52%, var(--surface));
+    }
+    .flow-node-head {
+      display: flex;
+      justify-content: space-between;
+      gap: var(--space-sm);
+      align-items: center;
+      position: relative;
+      z-index: 1;
+    }
+    .flow-node-name {
+      font-weight: 900;
+      overflow-wrap: anywhere;
+    }
+    .flow-node-meta {
+      color: var(--muted);
+      font-size: .84rem;
+      position: relative;
+      z-index: 1;
+    }
+    .flow-node.strong .flow-node-meta {
+      color: color-mix(in oklch, var(--muted) 86%, var(--brand));
+    }
+    .control-steps {
+      display: grid;
+      gap: var(--space-xs);
+      position: relative;
+      z-index: 1;
+    }
+    .control-step {
+      display: grid;
+      grid-template-columns: 28px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: var(--space-xs);
+      min-height: 46px;
+      border: 1px solid color-mix(in oklch, var(--line) 72%, transparent);
+      border-radius: var(--radius);
+      background: color-mix(in oklch, var(--surface) 82%, transparent);
+      padding: var(--space-xs);
+    }
+    .control-dot {
+      width: 26px;
+      height: 26px;
+      border-radius: 999px;
+      display: grid;
+      place-items: center;
+      font-size: .76rem;
+      font-weight: 900;
+      background: var(--info-soft);
+      color: var(--info);
+    }
+    .control-dot.ok { background: var(--brand-soft); color: var(--brand); }
+    .control-dot.bad { background: var(--danger-soft); color: var(--danger); }
+    .control-step-main {
+      display: grid;
+      gap: 1px;
+      min-width: 0;
+    }
+    .control-step-main strong {
+      font-size: .9rem;
+      line-height: 1.15;
+    }
+    .control-step-main span {
+      color: var(--muted);
+      font-size: .76rem;
+      overflow-wrap: anywhere;
+    }
+    .flow-stack {
+      display: grid;
+      gap: var(--space-sm);
+    }
+    .flow-metric-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: var(--space-xs);
+      position: relative;
+      z-index: 1;
+    }
+    .flow-metric {
+      display: grid;
+      gap: 2px;
+      padding: var(--space-xs);
+      border-radius: var(--radius);
+      border: 1px solid color-mix(in oklch, var(--line) 72%, transparent);
+      background: color-mix(in oklch, var(--surface-2) 58%, transparent);
+    }
+    .flow-metric strong {
+      font: 800 1rem/1 var(--display);
+    }
+    .flow-metric span {
+      color: var(--muted);
+      font-size: .7rem;
+      font-weight: 700;
+    }
+    .flow-node-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-xs);
+    }
+    .flow-chip {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 var(--space-sm);
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: var(--ink);
+      font-size: .78rem;
+      font-weight: 800;
+      max-width: 100%;
+    }
+    .flow-chip.ok { background: var(--brand-soft); color: var(--brand); }
+    .flow-chip.bad { background: var(--danger-soft); color: var(--danger); }
+    .flow-chip.info { background: var(--info-soft); color: var(--info); }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: var(--space-md);
+    }
+    .status {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: var(--space-md);
+      display: grid;
+      gap: var(--space-sm);
+      min-height: 150px;
+    }
+    .status-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--space-sm);
+    }
+    .status-title {
+      margin: 0;
+      font: 700 .95rem/1.2 var(--display);
+    }
+    .status-body { display: grid; gap: var(--space-xs); color: var(--muted); }
+    .status-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-xs); margin-top: auto; }
+
+    section {
+      display: grid;
+      gap: var(--space-md);
+      padding-top: var(--space-sm);
+    }
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: var(--space-md);
+      flex-wrap: wrap;
+    }
+    .section-title { display: grid; gap: var(--space-2xs); }
+    h3 {
+      margin: 0;
+      font: 700 1.15rem/1.15 var(--display);
+      letter-spacing: 0;
+    }
+    .section-title p, .meta { margin: 0; color: var(--muted); }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: visible;
+      padding: var(--space-sm);
+      display: grid;
+      gap: var(--space-sm);
+    }
+    .panel-pad { padding: var(--space-md); }
+    .toolbar {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto;
+      gap: var(--space-sm);
+      align-items: center;
+      padding: var(--space-md);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+    }
+    .check {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--space-xs);
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .check input { width: 16px; min-height: 16px; }
+
+    .railway-controls {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, .7fr);
+      gap: var(--space-md);
+    }
+    .control-group {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: var(--space-md);
+      display: grid;
+      gap: var(--space-sm);
+      background: var(--surface);
+    }
+    .control-group h4 {
+      margin: 0;
+      font: 700 .95rem/1.2 var(--display);
+    }
+    .control-group p { margin: 0; color: var(--muted); }
+    .button-row { display: flex; gap: var(--space-xs); flex-wrap: wrap; }
+
+    .list { display: grid; }
+    .row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: var(--space-md);
+      padding: var(--space-md);
+      border-bottom: 1px solid var(--line);
+    }
+    .row:last-child { border-bottom: 0; }
+    .row-main { min-width: 0; display: grid; gap: var(--space-2xs); }
+    .row-title {
+      display: flex;
+      align-items: center;
+      gap: var(--space-xs);
+      flex-wrap: wrap;
+      font-weight: 700;
+    }
+    .path, code {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: .8rem;
+      overflow-wrap: anywhere;
+    }
+    .empty {
+      color: var(--muted);
+      padding: var(--space-lg);
+      text-align: center;
+    }
+    .form-row {
+      display: grid;
+      grid-template-columns: minmax(140px, .7fr) minmax(180px, 1fr) auto;
+      gap: var(--space-sm);
+      padding: var(--space-md);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-2);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 var(--space-xs);
+      border-radius: 999px;
+      font-size: .73rem;
+      font-weight: 800;
+      letter-spacing: .02em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .ok { background: var(--brand-soft); color: var(--brand); }
+    .bad { background: var(--danger-soft); color: var(--danger); }
+    .maybe { background: var(--warn-soft); color: var(--warn); }
+    .info { background: var(--info-soft); color: var(--info); }
+    .violet { background: var(--violet-soft); color: var(--violet); }
+
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      padding: var(--space-sm) var(--space-md);
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-size: .75rem;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      background: var(--surface-2);
+    }
+    tr:last-child td { border-bottom: 0; }
+
+    .toast {
+      position: fixed;
+      top: var(--space-md);
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      width: min(760px, calc(100vw - 32px));
+      border-radius: var(--radius);
+      padding: var(--space-sm) var(--space-md);
+      box-shadow: 0 18px 42px color-mix(in oklch, var(--ink) 22%, transparent);
+      color: oklch(99% 0.004 92);
+      font-weight: 700;
+    }
+    .toast.ok-toast { background: var(--brand); }
+    .toast.warn-toast { background: var(--warn); color: oklch(18% 0.02 62); }
+    .toast.err-toast { background: var(--danger); }
+    .hidden { display: none !important; }
+
+    @media (max-width: 900px) {
+      .hero, .railway-controls, .status-grid, .flow-board { grid-template-columns: 1fr; }
+      .hero-panel { justify-self: stretch; width: 100%; }
+      .refresh { justify-items: start; }
+      .flow-board { min-height: auto; }
+      .flow-board::before { inset: 20px -10px 24px; filter: blur(22px); }
+      .flow-lines { display: none; }
+      .flow-node.strong { min-height: 140px; }
+    }
+    @media (max-width: 680px) {
+      .topbar-inner, .page { padding-left: var(--space-md); padding-right: var(--space-md); }
+      .row, .form-row, .toolbar { grid-template-columns: 1fr; }
+      .row { align-items: start; }
+      .row > .button-row, .row > button { justify-self: start; }
+      table { display: block; overflow-x: auto; }
+      .hero h2 { font-size: 1.6rem; }
+      .flow-head { padding: var(--space-md) 0 0; }
+      .flow-head { display: grid; align-items: start; }
+      .flow-board { padding: var(--space-lg) 0 var(--space-md); }
+      .flow-metric-row { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .flow-line { animation: none; }
+      button { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <h1>KEYRING</h1>
+      <div class="tagline">Agent network access, approvals, and audit.</div>
         </div>
-        <div class="reason" style="font-size:11px;margin-top:2px;text-overflow:ellipsis;overflow:hidden;white-space:nowrap">${esc(i.path)}</div>
+        <span id="top-helper" class="badge maybe">Checking helper</span>
       </div>
-      ${i.gated
-        ? `<button class="btn deny" data-act="disable" data-name="${esc(i.name)}">Disable</button>`
-        : `<button class="btn allow" data-act="enable" data-name="${esc(i.name)}" data-path="${esc(i.path)}">Enable</button>`}
-    </div>`;
-  }).join('') : '<div class="empty">no matches</div>';
-}
-// Event delegation — keeps the inline onclick attrs out of the picture (which broke quietly
-// when paths contained unusual characters or when the HTML was cached stale).
-document.addEventListener('click', async (ev) => {
-  // Proxy lifecycle + block-refresh
-  if (ev.target.id === 'btn-refresh-blocks') {
-    ev.target.disabled = true; ev.target.innerText = 'Refreshing…';
-    const r = await fetch('/api/proxy/refresh-blocks', { method: 'POST' });
-    const j2 = await r.json().catch(()=>({}));
-    if (r.ok) { lastBlockRefresh = Date.now(); banner(`✓ refreshed ${j2.refreshed} host(s); ${(j2.hosts||[]).flatMap(h=>h.ips||[]).length} IPs in block table`, 'ok'); }
-    else banner(`refresh failed: ${j2.error||r.status}`, 'err');
-    tick(); return;
-  }
-  if (ev.target.id === 'btn-proxy-start') {
-    ev.target.disabled = true; ev.target.innerText = 'Starting…';
-    const r = await fetch('/api/proxy/start', { method: 'POST' });
-    const j2 = await r.json().catch(()=>({}));
-    if (r.ok) { lastBlockRefresh = Date.now(); banner(`✓ proxy started · pid ${j2.pid} · running as ${j2.runningAs}`, 'ok'); }
-    else banner(`proxy start failed: ${j2.error||r.status}`, 'err');
-    tick(); return;
-  }
-  if (ev.target.id === 'btn-proxy-stop') {
-    if (!confirm('Stop the egress proxy? All gated CLIs will fail with Connection refused until restarted.')) return;
-    ev.target.disabled = true; ev.target.innerText = 'Stopping…';
-    const r = await fetch('/api/proxy/stop', { method: 'POST' });
-    const j2 = await r.json().catch(()=>({}));
-    if (r.ok) banner(`proxy stopped${j2.killed_pid?` (pid ${j2.killed_pid})`:''}`, 'warn');
-    else banner(`stop failed: ${j2.error||r.status}`, 'err');
-    tick(); return;
-  }
+    </header>
 
-  const btn = ev.target.closest('button[data-act]');
-  if (!btn) return;
-  const act = btn.dataset.act;
-  const name = btn.dataset.name;
-  const path = btn.dataset.path;
-  btn.disabled = true;
-  const orig = btn.innerText;
-  btn.innerText = act === 'enable' ? 'Enabling…' : 'Disabling…';
-  try {
-    if (act === 'enable') {
-      // 1. register the gate (metadata only; cheap, always works)
-      const r1 = await fetch('/api/gates', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ name, binPath: path }) });
-      if (!r1.ok) {
-        const e = await r1.json().catch(()=>({error:'failed'}));
-        throw new Error(e.error || r1.status);
-      }
-      // 2. install the shim — THIS is the actual block. If the helper isn't installed
-      // the call returns not_installed and we surface that clearly.
-      btn.innerText = 'Installing shim…';
-      const r2 = await fetch('/api/gates/' + encodeURIComponent(name) + '/install', { method: 'POST' });
-      if (!r2.ok) {
-        const e = await r2.json().catch(()=>({error:'failed'}));
-        if (e.error === 'not_installed') {
-          banner(`registered "${name}" — but the KEYRING helper isn't installed, so the binary is NOT actually blocked. Run: sudo keyring install`, 'warn');
-        } else {
-          banner(`shim install failed for "${name}": ${e.error}. Registered only — binary NOT blocked.`, 'warn');
-        }
-      } else {
-        banner(`✓ ${name} gated. /opt/homebrew/bin/${name} now routes through KEYRING. Any process invoking ${name} (you or any agent) hits the shim.`, 'ok');
-      }
-    } else {
-      // disable: uninstall shim first (idempotent), then unregister
-      btn.innerText = 'Uninstalling shim…';
-      await fetch('/api/gates/' + encodeURIComponent(name) + '/uninstall', { method: 'POST' });
-      const r = await fetch('/api/gates/' + encodeURIComponent(name), { method: 'DELETE' });
-      if (!r.ok) {
-        const e = await r.json().catch(()=>({error:'failed'}));
-        throw new Error(e.error || r.status);
-      }
-      banner(`✓ ${name} ungated. Binary restored.`, 'ok');
-    }
-    recentlyToggled.set(name, Date.now() + 1500);
-    await tick();
-  } catch (err) {
-    btn.innerText = String(err.message || err).slice(0, 60);
-    btn.style.color = '#ff8a99';
-    setTimeout(() => { btn.disabled = false; btn.innerText = orig; btn.style.color = ''; }, 4000);
-  }
-});
-function banner(msg, kind) {
-  let el = document.getElementById('toast');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'toast';
-    el.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);padding:10px 16px;border-radius:8px;font:13px ui-monospace,monospace;z-index:1000;max-width:760px;box-shadow:0 6px 20px rgba(0,0,0,.4)';
-    document.body.appendChild(el);
-  }
-  el.style.background = kind === 'ok' ? 'rgba(31,157,87,.95)' : (kind === 'warn' ? 'rgba(214,140,69,.95)' : 'rgba(214,69,91,.95)');
-  el.style.color = '#fff';
-  el.textContent = msg;
-  el.style.display = 'block';
-  clearTimeout(window.__toastT);
-  window.__toastT = setTimeout(() => { el.style.display = 'none'; }, 6000);
-}
-let lastBlockRefresh = null;
-async function tick(){
-  try{
-    discoveredCache = await j('/api/discovered-clis');
-    renderDiscovered();
-    // proxy health card
-    const px = await j('/api/proxy/health');
-    const pcard = document.getElementById('proxy-card');
-    const pstate = document.getElementById('proxy-state');
-    const pmeta = document.getElementById('proxy-meta');
-    pcard.style.display = 'block';
-    const running = !!px.pid && px.listening;
-    pmeta.textContent = running
-      ? `pid ${px.pid} · ${px.blockedIpCount} IPs blocked · ${px.shimsExist ? 'shims active' : 'no shims'}`
-      : (px.shimsExist ? 'DOWN — gated CLIs are failing closed' : 'down');
-    pmeta.style.color = running ? '#5fe39a' : (px.shimsExist ? '#ff8a99' : '#8a93a6');
-    const stateLine = running
-      ? `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
-           <div>
-             <span class="pill allowed">UP</span>
-             <span class="reason" style="margin-left:10px">port ${px.port} · uid <code style="color:var(--ink)">${esc(px.proxyUser)}</code></span>
-             <span class="reason" style="margin-left:10px">${px.blockedIpCount} IPs in kernel block table</span>
-             ${lastBlockRefresh ? `<span class="reason" style="margin-left:10px">refreshed ${Math.round((Date.now()-lastBlockRefresh)/1000)}s ago</span>` : ''}
-           </div>
-           <div>
-             <button class="btn" id="btn-refresh-blocks">Refresh IP blocks</button>
-             <button class="btn deny" id="btn-proxy-stop">Stop proxy</button>
-           </div>
-         </div>
-         ${px.blockedIps && px.blockedIps.length
-           ? `<details style="margin-top:10px"><summary class="reason" style="cursor:pointer">show ${px.blockedIps.length} blocked IPs</summary>
-              <div style="margin-top:6px;font-size:11px;color:var(--ink);font-family:ui-monospace,monospace">${px.blockedIps.map(esc).join(', ')}</div></details>`
-           : ''}`
-      : `<div>
-           <div style="color:${px.shimsExist ? '#ff8a99' : 'var(--mut)'};font-weight:${px.shimsExist ? '600' : 'normal'}">
-             ${px.shimsExist
-               ? '⚠️ Proxy is DOWN but shims are installed. Every gated CLI call is failing with Connection refused. Start the proxy now:'
-               : 'Proxy is not running. Start it when you enable your first gate.'}
-           </div>
-           <button class="btn allow" id="btn-proxy-start" style="margin-top:10px">Start proxy</button>
-         </div>`;
-    pstate.innerHTML = stateLine;
-    const jail=await j('/api/jail');
-    const badge=document.getElementById('jailbadge');
-    const card=document.getElementById('jail-card');
-    const state=document.getElementById('jail-state');
-    if (!jail.installed) {
-      badge.textContent = 'helper: NOT installed';
-      badge.style.color = '#ff8a99';
-      card.style.display = 'block';
-      state.innerHTML = `<div style="color:#ff8a99;font-weight:600">helper not installed</div>
-        <div class="reason" style="margin-top:6px">in your terminal, run once:</div>
-        <pre style="background:#0b0e14;padding:10px;border-radius:6px;margin-top:6px;overflow:auto"><code>sudo keyring install</code></pre>
-        <div class="reason" style="margin-top:6px">after that, everything below works without password prompts.</div>`;
-    } else {
-      const up = jail.rule_count > 0;
-      badge.textContent = up ? `jail: UP · ${jail.rule_count} rules` : 'jail: DOWN';
-      badge.style.color = up ? '#5fe39a' : '#8a93a6';
-      card.style.display = 'block';
-      state.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center;gap:12px">
+    <main class="page">
+      <div class="hero">
         <div>
-          <span class="pill ${up?'allowed':'denied'}">${up?'UP':'DOWN'}</span>
-          <span class="reason" style="margin-left:10px">user: ${jail.jail_user?'keyring-jail ✓':'missing ✗'}</span>
-          <span class="reason" style="margin-left:10px">anchor: ${jail.anchor?'loaded':'(empty)'}</span>
+          <h2>Approve what agents can reach.</h2>
+          <p>Watch agent traffic move from local tools through the guarded KEYRING path into approved destinations.</p>
         </div>
-        <div>
-          ${up
-            ? '<button class="btn deny" onclick="jailDown()">Bring jail down</button>'
-            : '<button class="btn allow" onclick="jailUp()">Bring jail up</button>'}
-        </div>
-      </div>`;
-    }
-
-    const gates=await j('/api/gates');
-    document.getElementById('gates').innerHTML = gates.length ? gates.map(g=>{
-      const cfg = (g.configPaths && g.configPaths.length) ? g.configPaths.join(', ') : '(no auth pass-through configured)';
-      return `<div style="padding:10px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:start;gap:12px">
-        <div style="flex:1;min-width:0">
-          <div><span class="host">${esc(g.name)}</span>
-            <span class="reason" style="margin-left:10px">${esc(g.binPath||'(no path)')}</span>
+        <div class="hero-panel">
+          <div class="hero-panel-title">
+            <span>Live Control Plane</span>
+            <span id="top-flow-state" class="badge maybe">Syncing</span>
           </div>
-          <div class="reason" style="margin-top:4px;font-size:12px">auth pass-through: ${esc(cfg)}</div>
-          <div class="reason" style="margin-top:4px;font-size:12px">invoke as agent: <code style="color:var(--ink)">keyring run -- ${esc(g.name)} &lt;args&gt;</code></div>
+          <p id="top-flow-copy">KEYRING is checking the helper, jail, proxy, and Railway access policy.</p>
+          <div class="refresh">
+            <button class="ghost" id="btn-refresh-now">Refresh</button>
+            <span id="last-refresh">Not refreshed yet</span>
+          </div>
         </div>
-        <div><button class="btn" onclick="rmGate('${esc(g.name)}')">Unregister</button></div>
-      </div>`;
-    }).join('') : '<div class="empty">no CLIs gated yet — register one below</div>';
+      </div>
 
-    const pend=await j('/api/pending');
-    document.getElementById('pending').innerHTML = pend.length ? pend.map(p=>
-      `<div style="padding:12px 16px;border-bottom:1px solid var(--line)">Allow agent to reach <span class="host">${esc(p.host)}</span> for task <b>${esc(p.taskId)}</b>?
-       <div style="margin-top:8px"><button class="btn allow" onclick="act('${p.id}','approve')">Allow</button><button class="btn deny" onclick="act('${p.id}','deny')">Deny</button></div></div>`
-    ).join('') : '<div class="empty">none</div>';
-    const a=await j('/api/audit'); a.reverse();
-    document.getElementById('audit').innerHTML = a.map(e=>{
-      const cls = e.decision==='allowed' ? 'allowed' : (e.decision==='invoked' ? '' : 'denied');
-      const t=new Date(e.ts).toLocaleTimeString();
-      return `<tr><td class="reason">${t}</td><td class="by">${esc(e.cli||'')}</td><td class="host">${esc(e.host||'')}</td><td>${cls?`<span class="pill ${cls}">${esc(e.decision)}</span>`:`<span class="reason">${esc(e.decision)}</span>`}</td><td class="reason">${esc(e.reason)}</td><td class="by">${esc(e.approver||'')}</td></tr>`;
-    }).join('') || '<tr><td colspan="6" class="empty">no events yet</td></tr>';
-  }catch(e){}
-}
-async function act(id,kind){ await fetch('/api/'+kind,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id})}); tick(); }
-async function addGate(){
-  const name=document.getElementById('g-name').value.trim();
-  const binPath=document.getElementById('g-bin').value.trim();
-  if(!name){return}
-  const r=await fetch('/api/gates',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,binPath:binPath||null})});
-  if(!r.ok){const e=await r.json().catch(()=>({error:'failed'}));alert('error: '+(e.error||r.status))}
-  document.getElementById('g-name').value=''; document.getElementById('g-bin').value=''; tick();
-}
-async function rmGate(name){
-  const r=await fetch('/api/gates/'+encodeURIComponent(name),{method:'DELETE'});
-  if(!r.ok){const e=await r.json().catch(()=>({error:'failed'}));alert('error: '+(e.error||r.status)+(e.hint?'\n'+e.hint:''))}
-  tick();
-}
-async function jailUp(){
-  const r=await fetch('/api/jail/up',{method:'POST'});
-  if(!r.ok){const e=await r.json().catch(()=>({}));alert('jail up failed: '+(e.error||r.status))}
-  tick();
-}
-async function jailDown(){
-  if(!confirm('bring jail down? gated CLIs become bypassable.'))return;
-  const r=await fetch('/api/jail/down',{method:'POST'});
-  if(!r.ok){const e=await r.json().catch(()=>({}));alert('jail down failed: '+(e.error||r.status))}
-  tick();
-}
-tick(); setInterval(tick,1500);
-</script></body></html>
+      <section class="flow-shell" aria-labelledby="flow-title">
+        <div class="flow-head">
+          <div>
+            <h3 id="flow-title">Access Flow</h3>
+            <p>Sources enter on the left, KEYRING enforces the route in the center, and only approved destinations leave on the right.</p>
+          </div>
+          <span id="flow-summary" class="badge maybe">Loading</span>
+        </div>
+        <svg class="flow-lines" viewBox="0 0 1000 360" preserveAspectRatio="none" aria-hidden="true">
+          <path id="flow-line-a" class="flow-line muted" d="M 170 92 C 300 92, 330 180, 468 180"></path>
+          <path id="flow-line-b" class="flow-line muted" d="M 170 268 C 300 268, 330 180, 468 180"></path>
+          <path id="flow-line-c" class="flow-line muted" d="M 532 180 C 670 180, 700 92, 830 92"></path>
+          <path id="flow-line-d" class="flow-line muted" d="M 532 180 C 670 180, 700 268, 830 268"></path>
+        </svg>
+        <div id="access-flow" class="flow-board">
+          <div class="flow-column"><div class="flow-label">Sources</div><div class="flow-node"><div class="flow-node-meta">Loading sources.</div></div></div>
+          <div class="flow-column"><div class="flow-label">KEYRING</div><div class="flow-node strong"><div class="flow-node-name">Checking control plane</div></div></div>
+          <div class="flow-column"><div class="flow-label">Destinations</div><div class="flow-node"><div class="flow-node-meta">Loading destinations.</div></div></div>
+        </div>
+      </section>
+
+      <div class="status-grid">
+        <article class="status" id="helper-card">
+          <div class="status-head">
+            <h3 class="status-title">Helper</h3>
+            <span id="helper-badge" class="badge maybe">Unknown</span>
+          </div>
+          <div id="helper-body" class="status-body">Checking the privileged helper.</div>
+          <div id="helper-actions" class="status-actions"></div>
+        </article>
+
+        <article class="status" id="jail-card">
+          <div class="status-head">
+            <h3 class="status-title">Agent Jail</h3>
+            <span id="jail-badge" class="badge maybe">Unknown</span>
+          </div>
+          <div id="jail-body" class="status-body">Checking pf rules.</div>
+          <div id="jail-actions" class="status-actions"></div>
+        </article>
+
+        <article class="status" id="proxy-card">
+          <div class="status-head">
+            <h3 class="status-title">Proxy</h3>
+            <span id="proxy-badge" class="badge maybe">Unknown</span>
+          </div>
+          <div id="proxy-body" class="status-body">Checking KEYRING proxy.</div>
+          <div id="proxy-actions" class="status-actions"></div>
+        </article>
+      </div>
+
+      <section>
+        <div class="section-head">
+          <div class="section-title">
+            <h3>Railway Access</h3>
+            <p id="access-meta">Loading current Railway policy.</p>
+          </div>
+          <button class="ghost" id="btn-access-notify">Notify Slack</button>
+        </div>
+        <div id="access-state" class="railway-controls"></div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <div class="section-title">
+            <h3>Discovered CLIs</h3>
+            <p id="disc-meta">Scanning local PATH.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="toolbar">
+            <input id="d-filter" placeholder="Filter by name or path" autocomplete="off">
+            <label class="check"><input id="d-onlygated" type="checkbox"> Enabled only</label>
+          </div>
+          <div id="discovered" class="list"><div class="empty">Scanning...</div></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <div class="section-title">
+            <h3>Registered Gates</h3>
+            <p>These CLIs are known to KEYRING. Shimmed gates are actively enforced.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div id="gates" class="list"><div class="empty">No CLIs registered yet.</div></div>
+          <div class="form-row">
+            <input id="g-name" placeholder="CLI name, e.g. railway" autocomplete="off">
+            <input id="g-bin" placeholder="Optional binary path" autocomplete="off">
+            <button class="primary" id="btn-register-gate">Register</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <div class="section-title">
+            <h3>Pending Approvals</h3>
+            <p>Requests waiting for a human decision.</p>
+          </div>
+        </div>
+        <div id="pending" class="panel list"><div class="empty">None</div></div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <div class="section-title">
+            <h3>Audit Trail</h3>
+            <p>The latest access decisions and policy changes.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <table>
+            <thead><tr><th>Time</th><th>CLI</th><th>Host</th><th>Decision</th><th>Reason</th><th>Approver</th></tr></thead>
+            <tbody id="audit"><tr><td colspan="6" class="empty">No events yet</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const api = async (url, opts) => {
+      const res = await fetch(url, opts);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw Object.assign(new Error(body.error || res.statusText || 'request_failed'), { body, status: res.status });
+      return body;
+    };
+    const esc = value => String(value == null ? '' : value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+    const badge = (text, tone) => `<span class="badge ${tone}">${esc(text)}</span>`;
+    const pathText = value => `<span class="path">${esc(value || '')}</span>`;
+
+    let discoveredCache = { items: [], host: '', count: 0, gatedCount: 0 };
+    let refreshTimer = null;
+
+    function toast(message, kind = 'ok') {
+      let el = $('toast');
+      if (!el) {
+        el = document.createElement('div');
+        el.id = 'toast';
+        el.className = 'toast hidden';
+        document.body.appendChild(el);
+      }
+      el.textContent = message;
+      el.className = `toast ${kind}-toast`;
+      clearTimeout(window.__toastTimer);
+      window.__toastTimer = setTimeout(() => el.classList.add('hidden'), 5500);
+    }
+
+    function setBusy(button, label) {
+      if (!button) return () => {};
+      const previous = button.textContent;
+      button.disabled = true;
+      button.textContent = label;
+      return () => {
+        button.disabled = false;
+        button.textContent = previous;
+      };
+    }
+
+    function flowChip(text, tone = 'info') {
+      return `<span class="flow-chip ${tone}">${esc(text)}</span>`;
+    }
+
+    function setFlowLines(tone) {
+      const cls = tone === 'ok' ? 'flow-line' : (tone === 'bad' ? 'flow-line danger' : 'flow-line muted');
+      ['flow-line-a', 'flow-line-b', 'flow-line-c', 'flow-line-d'].forEach(id => {
+        const line = $(id);
+        if (line) line.setAttribute('class', cls);
+      });
+    }
+
+    function renderAccessFlow({ discovered, proxy, railway, jail, gates, pending, audit }) {
+      const helperReady = !!jail.installed;
+      const jailUp = Number(jail.rule_count || 0) > 0;
+      const proxyUp = !!proxy.pid && !!proxy.listening;
+      const railwayDirectBlocked = railway.direct === 'blocked';
+      const railwayProxyDenied = railway.proxy === 'denied';
+      const railwayProxyAllowed = railway.proxy === 'allowed';
+      const healthyRoute = helperReady && jailUp && proxyUp && railwayDirectBlocked && !railwayProxyDenied;
+      const blockedRoute = railwayProxyDenied || !railwayDirectBlocked;
+      const routeTone = healthyRoute ? 'ok' : (blockedRoute ? 'bad' : 'maybe');
+      const routeLabel = healthyRoute ? 'Guarded route active' : (railwayProxyDenied ? 'Proxy route denied' : (!railwayDirectBlocked ? 'Direct path open' : 'Route needs attention'));
+      const shimmed = (gates || []).filter(gate => gate.enforcement === 'shimmed');
+      const registered = (gates || []).filter(gate => gate.enforcement !== 'shimmed');
+      const recentDenied = (audit || []).filter(event => event.decision && event.decision !== 'allowed' && event.decision !== 'invoked').length;
+      const recentAllowed = (audit || []).filter(event => event.decision === 'allowed').length;
+      const primaryCli = shimmed[0] || gates[0] || null;
+      const sourceChips = [
+        flowChip(`${discovered.gatedCount || 0} enabled`, discovered.gatedCount ? 'ok' : 'info'),
+        flowChip(`${discovered.count || 0} discovered`, 'info'),
+        primaryCli ? flowChip(primaryCli.name, primaryCli.enforcement === 'shimmed' ? 'ok' : 'info') : flowChip('No CLI selected', 'bad')
+      ].join('');
+      const destinationTone = railwayProxyDenied ? 'bad' : (railwayProxyAllowed ? 'ok' : 'info');
+      const destinationLabel = railwayProxyDenied ? 'Denied' : (railwayProxyAllowed ? 'Allowed' : 'Approval required');
+
+      $('top-flow-state').className = `badge ${routeTone}`;
+      $('top-flow-state').textContent = routeLabel;
+      $('top-flow-copy').textContent = healthyRoute
+        ? 'Agent traffic is constrained, proxied, and ready for human-approved Railway access.'
+        : 'The flow below shows which part of the guarded route needs attention before agent traffic is protected.';
+      $('flow-summary').className = `badge ${routeTone}`;
+      $('flow-summary').textContent = routeLabel;
+      setFlowLines(routeTone);
+
+      $('access-flow').innerHTML = `
+        <div class="flow-column">
+          <div class="flow-label">Sources</div>
+          <div class="flow-node">
+            <div class="flow-node-head">
+              <div class="flow-node-name">Agent process</div>
+              ${badge(jailUp ? 'Jailed' : 'Open', jailUp ? 'ok' : 'maybe')}
+            </div>
+            <div class="flow-node-meta">Commands launched through KEYRING inherit the constrained network path.</div>
+            <div class="flow-node-list">${flowChip('keyring run --', jailUp ? 'ok' : 'info')} ${flowChip(`${jail.rule_count || 0} pf rules`, jailUp ? 'ok' : 'bad')}</div>
+          </div>
+          <div class="flow-node">
+            <div class="flow-node-head">
+              <div class="flow-node-name">Local CLIs</div>
+              ${badge(shimmed.length ? 'Shimmed' : 'Registered', shimmed.length ? 'ok' : 'info')}
+            </div>
+            <div class="flow-node-meta">${shimmed.length} shimmed, ${registered.length} registered, scanned on ${esc(discovered.host || 'this host')}.</div>
+            <div class="flow-node-list">${sourceChips}</div>
+          </div>
+        </div>
+
+        <div class="flow-column">
+          <div class="flow-label">Control Plane</div>
+          <div class="flow-node strong ${routeTone === 'bad' ? 'warn-node' : ''}">
+            <div class="flow-node-head">
+              <div class="flow-node-name">KEYRING Policy Router</div>
+              ${badge(routeLabel, routeTone)}
+            </div>
+            <div class="flow-node-meta">The center is an enforcement sequence, not a black box. Each check has to pass before traffic leaves the machine.</div>
+            <div class="control-steps">
+              <div class="control-step">
+                <div class="control-dot ${helperReady ? 'ok' : 'bad'}">${helperReady ? '1' : '!'}</div>
+                <div class="control-step-main"><strong>Privileged helper</strong><span>${helperReady ? 'Installed and ready for local enforcement.' : 'Missing; install before managing the jail.'}</span></div>
+                ${badge(helperReady ? 'Ready' : 'Missing', helperReady ? 'ok' : 'bad')}
+              </div>
+              <div class="control-step">
+                <div class="control-dot ${jailUp ? 'ok' : 'bad'}">${jailUp ? '2' : '!'}</div>
+                <div class="control-step-main"><strong>Agent jail</strong><span>${jailUp ? `${jail.rule_count || 0} pf rules constrain the agent route.` : 'Rules are not loaded.'}</span></div>
+                ${badge(jailUp ? 'Jailed' : 'Open', jailUp ? 'ok' : 'bad')}
+              </div>
+              <div class="control-step">
+                <div class="control-dot ${proxyUp ? 'ok' : 'bad'}">${proxyUp ? '3' : '!'}</div>
+                <div class="control-step-main"><strong>Egress proxy</strong><span>${proxyUp ? `Listening on port ${proxy.port}; ${proxy.blockedIpCount || 0} IPs blocked.` : 'Stopped; shimmed CLIs fail closed.'}</span></div>
+                ${badge(proxyUp ? 'Online' : 'Down', proxyUp ? 'ok' : 'bad')}
+              </div>
+              <div class="control-step">
+                <div class="control-dot ${railwayProxyDenied ? 'bad' : (railwayProxyAllowed ? 'ok' : '')}">${railwayProxyDenied ? '!' : '4'}</div>
+                <div class="control-step-main"><strong>Human approval</strong><span>${railwayProxyDenied ? 'Railway proxy requests are denied.' : (railwayProxyAllowed ? 'Railway proxy requests are currently allowed.' : 'Next request waits for approval.')}</span></div>
+                ${badge(railwayProxyDenied ? 'Denied' : (railwayProxyAllowed ? 'Allowed' : 'Waiting'), railwayProxyDenied ? 'bad' : (railwayProxyAllowed ? 'ok' : 'info'))}
+              </div>
+            </div>
+            <div class="flow-metric-row">
+              <div class="flow-metric"><strong>${helperReady ? 'On' : 'Off'}</strong><span>Helper</span></div>
+              <div class="flow-metric"><strong>${proxyUp ? 'Up' : 'Down'}</strong><span>Proxy</span></div>
+              <div class="flow-metric"><strong>${pending.length}</strong><span>Pending</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="flow-column">
+          <div class="flow-label">Destinations</div>
+          <div class="flow-node">
+            <div class="flow-node-head">
+              <div class="flow-node-name">Railway</div>
+              ${badge(destinationLabel, destinationTone)}
+            </div>
+            <div class="flow-node-meta">Direct access is ${railway.direct}; KEYRING proxy is ${railway.proxy}.</div>
+            <div class="flow-node-list">
+              ${flowChip(railwayDirectBlocked ? 'Direct blocked' : 'Direct open', railwayDirectBlocked ? 'ok' : 'bad')}
+              ${flowChip(destinationLabel, destinationTone)}
+            </div>
+          </div>
+          <div class="flow-node">
+            <div class="flow-node-head">
+              <div class="flow-node-name">Audit and Slack</div>
+              ${badge(pending.length ? 'Waiting' : 'Quiet', pending.length ? 'info' : 'ok')}
+            </div>
+            <div class="flow-node-meta">Approvals and policy changes stay visible after the connection decision.</div>
+            <div class="flow-node-list">
+              ${flowChip(`${pending.length} pending`, pending.length ? 'info' : 'ok')}
+              ${flowChip(`${recentAllowed} allowed`, 'ok')}
+              ${flowChip(`${recentDenied} denied`, recentDenied ? 'bad' : 'info')}
+            </div>
+          </div>
+        </div>`;
+    }
+
+    function renderHelper(jail) {
+      const installed = !!jail.installed;
+      $('top-helper').className = `badge ${installed ? 'ok' : 'bad'}`;
+      $('top-helper').textContent = installed ? 'Helper installed' : 'Helper missing';
+      $('helper-badge').className = `badge ${installed ? 'ok' : 'bad'}`;
+      $('helper-badge').textContent = installed ? 'Ready' : 'Missing';
+      $('helper-body').innerHTML = installed
+        ? `<div>The privileged helper is installed. Dashboard actions can manage the jail and proxy without password prompts.</div>`
+        : `<div>The helper is not installed yet.</div><code>sudo keyring install</code><div>Run that once in your terminal, then refresh this page.</div>`;
+      $('helper-actions').innerHTML = installed ? '' : `<button class="ghost" id="btn-copy-install">Copy install command</button>`;
+    }
+
+    function renderJail(jail) {
+      if (!jail.installed) {
+        $('jail-badge').className = 'badge bad';
+        $('jail-badge').textContent = 'Unavailable';
+        $('jail-body').innerHTML = 'Install the helper before starting the agent jail.';
+        $('jail-actions').innerHTML = '';
+        return;
+      }
+      const up = Number(jail.rule_count || 0) > 0;
+      $('jail-badge').className = `badge ${up ? 'ok' : 'maybe'}`;
+      $('jail-badge').textContent = up ? 'Up' : 'Down';
+      $('jail-body').innerHTML = [
+        `<div>${up ? 'Agent traffic is constrained by pf rules.' : 'Agent jail rules are not loaded.'}</div>`,
+        `<div>${badge(jail.jail_user ? 'jail user ok' : 'jail user missing', jail.jail_user ? 'ok' : 'bad')} ${badge(jail.anchor ? 'anchor loaded' : 'anchor empty', jail.anchor ? 'ok' : 'maybe')}</div>`,
+        `<div>${esc(jail.rule_count || 0)} active rule(s)</div>`
+      ].join('');
+      $('jail-actions').innerHTML = up
+        ? `<button class="danger" id="btn-jail-down">Bring jail down</button>`
+        : `<button class="primary" id="btn-jail-up">Bring jail up</button>`;
+    }
+
+    function renderProxy(px) {
+      const running = !!px.pid && !!px.listening;
+      const failingClosed = !running && !!px.shimsExist;
+      $('proxy-badge').className = `badge ${running ? 'ok' : (failingClosed ? 'bad' : 'maybe')}`;
+      $('proxy-badge').textContent = running ? 'Running' : 'Stopped';
+      $('proxy-body').innerHTML = running
+        ? `<div>Listening on port ${esc(px.port)} as ${esc(px.proxyUser || 'proxy user')}.</div><div>${badge(`${px.blockedIpCount || 0} IPs blocked`, 'info')} ${badge(px.shimsExist ? 'shims active' : 'no shims', px.shimsExist ? 'ok' : 'maybe')}</div>`
+        : `<div>${failingClosed ? 'Shimmed CLIs are failing closed until the proxy starts.' : 'Start the proxy when you enable a gate.'}</div><div>${badge(px.shimsExist ? 'shims installed' : 'no shims', px.shimsExist ? 'bad' : 'maybe')}</div>`;
+      $('proxy-actions').innerHTML = running
+        ? `<button class="ghost" id="btn-refresh-blocks">Refresh IP blocks</button><button class="danger" id="btn-proxy-stop">Stop proxy</button>`
+        : `<button class="primary" id="btn-proxy-start">Start proxy</button>`;
+    }
+
+    function renderRailway(rule) {
+      const blocked = rule.direct === 'blocked';
+      const proxyDenied = rule.proxy === 'denied';
+      const proxyAllowed = rule.proxy === 'allowed';
+      const grantText = rule.proxyGrant ? (rule.proxyGrant.exp ? `until ${new Date(rule.proxyGrant.exp).toLocaleTimeString()}` : 'forever') : '';
+      $('access-meta').textContent = `Direct ${rule.direct}; KEYRING proxy ${rule.proxy}${grantText ? ` (${grantText})` : ''}. Last changed by ${rule.lastChangedBy || 'system'}.`;
+      $('access-state').innerHTML = `
+        <div class="control-group">
+          <h4>Direct Railway</h4>
+          <div>${badge(blocked ? 'Blocked' : 'Unblocked', blocked ? 'ok' : 'bad')}</div>
+          <p>${blocked ? 'Direct Railway egress is blocked, so agents must use KEYRING.' : 'Direct Railway egress is open. Block it before testing the protected path.'}</p>
+          <div class="button-row">
+            <button class="primary" id="btn-access-block" ${blocked ? 'disabled' : ''}>Block direct</button>
+            <button class="danger" id="btn-access-unblock" ${blocked ? '' : 'disabled'}>Unblock direct</button>
+          </div>
+        </div>
+        <div class="control-group">
+          <h4>KEYRING Railway</h4>
+          <div>
+            ${badge(proxyDenied ? 'Denied' : (proxyAllowed ? 'Allowed' : 'Needs approval'), proxyDenied ? 'bad' : (proxyAllowed ? 'ok' : 'info'))}
+            ${grantText ? badge(`Grant ${grantText}`, 'ok') : ''}
+          </div>
+          <p>${proxyDenied ? 'KEYRING will deny Railway proxy requests.' : (proxyAllowed ? 'Railway proxy requests are allowed and still visible in Slack/audit.' : 'The next Railway proxy request waits for human approval.')}</p>
+          <div class="button-row">
+            <button class="danger" id="btn-proxy-deny" ${proxyDenied ? 'disabled' : ''}>Deny</button>
+            <button class="primary" id="btn-proxy-require" ${rule.proxy === 'requires_approval' ? 'disabled' : ''}>Require approval</button>
+            <button class="primary" id="btn-proxy-allow" ${proxyAllowed ? 'disabled' : ''}>Allow forever</button>
+          </div>
+        </div>`;
+    }
+
+    function renderDiscovered() {
+      const filter = ($('d-filter').value || '').trim().toLowerCase();
+      const onlyGated = $('d-onlygated').checked;
+      const items = discoveredCache.items
+        .filter(item =>
+          (!filter || item.name.toLowerCase().includes(filter) || (item.path || '').toLowerCase().includes(filter)) &&
+          (!onlyGated || item.gated)
+        )
+        .sort((a, b) => Number(b.gated) - Number(a.gated) || a.name.localeCompare(b.name));
+
+      $('disc-meta').textContent = `${discoveredCache.gatedCount} of ${discoveredCache.count} enabled on ${discoveredCache.host || 'this host'}.`;
+      $('discovered').innerHTML = items.length ? items.map(item => `
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">
+              ${esc(item.name)}
+              ${item.gated ? badge(item.enforcement === 'shimmed' ? 'Shimmed' : 'Registered', item.enforcement === 'shimmed' ? 'ok' : 'info') : badge('Not enabled', 'maybe')}
+            </div>
+            ${pathText(item.path)}
+          </div>
+          <button class="${item.gated ? 'danger' : 'primary'}" data-act="${item.gated ? 'disable' : 'enable'}" data-name="${esc(item.name)}" data-path="${esc(item.path)}">${item.gated ? 'Disable' : 'Enable'}</button>
+        </div>`).join('') : `<div class="empty">No CLIs match that filter.</div>`;
+    }
+
+    function renderGates(gates) {
+      $('gates').innerHTML = gates.length ? gates.map(gate => {
+        const cfg = gate.configPaths && gate.configPaths.length ? gate.configPaths.join(', ') : 'No auth pass-through configured';
+        const shimmed = gate.enforcement === 'shimmed';
+        return `<div class="row">
+          <div class="row-main">
+            <div class="row-title">
+              ${esc(gate.name)}
+              ${badge(shimmed ? 'Shimmed' : 'Registered', shimmed ? 'ok' : 'info')}
+            </div>
+            ${pathText(gate.binPath || 'No binary path stored')}
+            <div class="meta">Auth pass-through: ${esc(cfg)}</div>
+            <code>keyring run -- ${esc(gate.name)} &lt;args&gt;</code>
+          </div>
+          <div class="button-row">
+            ${shimmed ? `<button class="danger" data-act="disable" data-name="${esc(gate.name)}">Disable</button>` : ''}
+            <button class="ghost" data-act="unregister" data-name="${esc(gate.name)}">Unregister</button>
+          </div>
+        </div>`;
+      }).join('') : `<div class="empty">No CLIs registered yet.</div>`;
+    }
+
+    function renderPending(pending) {
+      $('pending').innerHTML = pending.length ? pending.map(item => `
+        <div class="row">
+          <div class="row-main">
+            <div class="row-title">Allow ${esc(item.host)}?</div>
+            <div class="meta">Task ${esc(item.taskId)}${item.cli ? ` · ${esc(item.cli)}` : ''}</div>
+          </div>
+          <div class="button-row">
+            <button class="primary" data-approval="approve" data-id="${esc(item.id)}">Allow</button>
+            <button class="danger" data-approval="deny" data-id="${esc(item.id)}">Deny</button>
+          </div>
+        </div>`).join('') : `<div class="empty">No pending approvals.</div>`;
+    }
+
+    function renderAudit(events) {
+      const rows = [...events].reverse();
+      $('audit').innerHTML = rows.length ? rows.map(event => {
+        const tone = event.decision === 'allowed' ? 'ok' : (event.decision === 'invoked' ? 'info' : 'bad');
+        return `<tr>
+          <td class="meta">${esc(new Date(event.ts).toLocaleTimeString())}</td>
+          <td>${esc(event.cli || '')}</td>
+          <td>${esc(event.host || '')}</td>
+          <td>${badge(event.decision || 'event', tone)}</td>
+          <td class="meta">${esc(event.reason || '')}</td>
+          <td>${esc(event.approver || '')}</td>
+        </tr>`;
+      }).join('') : `<tr><td colspan="6" class="empty">No events yet</td></tr>`;
+    }
+
+    async function enableGate(name, binPath) {
+      await api('/api/gates', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name, binPath: binPath || null })
+      });
+      try {
+        await api(`/api/gates/${encodeURIComponent(name)}/install`, { method: 'POST' });
+        toast(`${name} is enabled and shimmed.`, 'ok');
+      } catch (err) {
+        const message = err.body && err.body.error === 'not_installed'
+          ? `${name} is registered, but the helper is not installed. Run sudo keyring install.`
+          : `${name} is registered, but shim install failed: ${err.message}`;
+        toast(message, 'warn');
+      }
+    }
+
+    async function disableGate(name) {
+      await fetch(`/api/gates/${encodeURIComponent(name)}/uninstall`, { method: 'POST' }).catch(() => {});
+      await api(`/api/gates/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      toast(`${name} is disabled.`, 'ok');
+    }
+
+    async function unregisterGate(name) {
+      await api(`/api/gates/${encodeURIComponent(name)}`, { method: 'DELETE' });
+      toast(`${name} is unregistered.`, 'ok');
+    }
+
+    async function tick() {
+      try {
+        const [discovered, proxy, railway, jail, gates, pending, audit] = await Promise.all([
+          api('/api/discovered-clis'),
+          api('/api/proxy/health'),
+          api('/api/access-rules/railway'),
+          api('/api/jail'),
+          api('/api/gates'),
+          api('/api/pending'),
+          api('/api/audit')
+        ]);
+        discoveredCache = discovered;
+        renderHelper(jail);
+        renderJail(jail);
+        renderProxy(proxy);
+        renderRailway(railway);
+        renderAccessFlow({ discovered, proxy, railway, jail, gates, pending, audit });
+        renderDiscovered();
+        renderGates(gates);
+        renderPending(pending);
+        renderAudit(audit);
+        $('last-refresh').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+      } catch (err) {
+        toast(`Refresh failed: ${err.message}`, 'err');
+      }
+    }
+
+    document.addEventListener('input', event => {
+      if (event.target.id === 'd-filter' || event.target.id === 'd-onlygated') renderDiscovered();
+    });
+
+    document.addEventListener('click', async event => {
+      const target = event.target.closest('button');
+      if (!target) return;
+      try {
+        if (target.id === 'btn-refresh-now') return tick();
+        if (target.id === 'btn-copy-install') {
+          await navigator.clipboard.writeText('sudo keyring install');
+          return toast('Install command copied.', 'ok');
+        }
+        if (target.id === 'btn-jail-up') {
+          const done = setBusy(target, 'Starting...');
+          await api('/api/jail/up', { method: 'POST' });
+          done(); toast('Agent jail is up.', 'ok'); return tick();
+        }
+        if (target.id === 'btn-jail-down') {
+          if (!confirm('Bring the agent jail down? Gated CLIs become bypassable.')) return;
+          const done = setBusy(target, 'Stopping...');
+          await api('/api/jail/down', { method: 'POST' });
+          done(); toast('Agent jail is down.', 'warn'); return tick();
+        }
+        if (target.id === 'btn-proxy-start') {
+          const done = setBusy(target, 'Starting...');
+          const result = await api('/api/proxy/start', { method: 'POST' });
+          done(); toast(`Proxy started on port ${result.port}.`, 'ok'); return tick();
+        }
+        if (target.id === 'btn-proxy-stop') {
+          if (!confirm('Stop the egress proxy? Shimmed CLIs will fail closed until it restarts.')) return;
+          const done = setBusy(target, 'Stopping...');
+          await api('/api/proxy/stop', { method: 'POST' });
+          done(); toast('Proxy stopped.', 'warn'); return tick();
+        }
+        if (target.id === 'btn-refresh-blocks') {
+          const done = setBusy(target, 'Refreshing...');
+          const result = await api('/api/proxy/refresh-blocks', { method: 'POST' });
+          done(); toast(`Refreshed ${result.refreshed} host block(s).`, 'ok'); return tick();
+        }
+        if (target.id === 'btn-access-block' || target.id === 'btn-access-unblock') {
+          const action = target.id === 'btn-access-block' ? 'block' : 'unblock';
+          await api(`/api/access-rules/railway/${action}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ by: 'dashboard', source: 'dashboard' })
+          });
+          toast(`Direct Railway is ${action === 'block' ? 'blocked' : 'unblocked'}.`, action === 'block' ? 'ok' : 'warn');
+          return tick();
+        }
+        if (target.id === 'btn-proxy-deny' || target.id === 'btn-proxy-require' || target.id === 'btn-proxy-allow') {
+          const proxy = target.id === 'btn-proxy-deny' ? 'denied' : (target.id === 'btn-proxy-allow' ? 'allowed' : 'requires_approval');
+          await api('/api/access-rules/railway/proxy', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ proxy, by: 'dashboard', source: 'dashboard' })
+          });
+          toast(`KEYRING Railway is ${proxy}.`, proxy === 'denied' ? 'warn' : 'ok');
+          return tick();
+        }
+        if (target.id === 'btn-access-notify') {
+          const done = setBusy(target, 'Sending...');
+          await api('/api/access-rules/railway/notify', { method: 'POST' });
+          done(); toast('Slack notification sent.', 'ok'); return tick();
+        }
+        if (target.id === 'btn-register-gate') {
+          const name = $('g-name').value.trim();
+          const binPath = $('g-bin').value.trim();
+          if (!name) return toast('Enter a CLI name first.', 'warn');
+          await api('/api/gates', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name, binPath: binPath || null })
+          });
+          $('g-name').value = '';
+          $('g-bin').value = '';
+          toast(`${name} is registered.`, 'ok');
+          return tick();
+        }
+        if (target.dataset.act === 'enable') {
+          const done = setBusy(target, 'Enabling...');
+          await enableGate(target.dataset.name, target.dataset.path);
+          done(); return tick();
+        }
+        if (target.dataset.act === 'disable') {
+          const done = setBusy(target, 'Disabling...');
+          await disableGate(target.dataset.name);
+          done(); return tick();
+        }
+        if (target.dataset.act === 'unregister') {
+          const done = setBusy(target, 'Removing...');
+          await unregisterGate(target.dataset.name);
+          done(); return tick();
+        }
+        if (target.dataset.approval) {
+          await api(`/api/${target.dataset.approval}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: target.dataset.id })
+          });
+          toast(`Request ${target.dataset.approval === 'approve' ? 'allowed' : 'denied'}.`, target.dataset.approval === 'approve' ? 'ok' : 'warn');
+          return tick();
+        }
+      } catch (err) {
+        toast(err.message || 'Action failed', 'err');
+        await tick();
+      }
+    });
+
+    tick();
+    refreshTimer = setInterval(tick, 2500);
+    window.addEventListener('beforeunload', () => clearInterval(refreshTimer));
+  </script>
+</body>
+</html>

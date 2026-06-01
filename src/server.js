@@ -1,5 +1,6 @@
 // Audit + approval HTTP server, the Slack interactivity endpoint, and a tiny dashboard.
 // Deploy this (e.g. Vercel/Fly/Render) so Slack can reach /api/slack/interactivity.
+require('./env').loadDotEnv();
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -16,6 +17,13 @@ const PROXY_PID_FILE = path.join(os.tmpdir(), 'keyring-proxy.pid');
 const PROXY_LOG_FILE = path.join(os.tmpdir(), 'keyring-proxy.log');
 const DEFAULT_PROXY_PORT = parseInt(process.env.KEYRING_PROXY_PORT || '8080', 10);
 const DEFAULT_TASK = 'default';
+
+function dashboardUrl() {
+  return core.getRuntimeConfig().dashboardUrl || process.env.KEYRING_DASHBOARD_URL || undefined;
+}
+if (process.env.KEYRING_DASHBOARD_URL) {
+  core.setRuntimeConfig({ dashboardUrl: process.env.KEYRING_DASHBOARD_URL });
+}
 
 function probePort(port) {
   return new Promise(resolve => {
@@ -79,8 +87,124 @@ function send(res, code, body, type) {
   res.writeHead(code, { 'content-type': type || 'application/json' });
   res.end(typeof body === 'string' ? body : JSON.stringify(body));
 }
+function sendText(res, code, text) {
+  send(res, code, text + '\n', 'text/plain; charset=utf-8');
+}
 function readBody(req) {
   return new Promise(r => { let d = ''; req.on('data', c => d += c); req.on('end', () => r(d)); });
+}
+
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  })[ch]);
+}
+
+function slackDecisionConfirmPage(params) {
+  const safe = Object.fromEntries(Object.entries(params).map(([k, v]) => [k, escapeHtml(v)]));
+  const label = {
+    allow_10m: 'Allow for 10 minutes',
+    allow_forever: 'Allow forever',
+    allow: 'Allow',
+    deny: 'Deny',
+    deny_future: 'Deny future approvals',
+    require_approval: 'Require approval'
+  }[params.decision] || params.decision || 'Confirm';
+  const hidden = ['decision', 'id', 'cli', 'token', 'version']
+    .filter(k => params[k])
+    .map(k => `<input type="hidden" name="${k}" value="${safe[k]}">`)
+    .join('\n');
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Confirm KEYRING Slack decision</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #101418; color: #eef2f5; }
+    main { width: min(520px, calc(100vw - 32px)); }
+    h1 { font-size: 24px; margin: 0 0 12px; }
+    p { color: #b8c2cc; margin: 0 0 20px; }
+    code { background: #1f2830; border: 1px solid #33404b; border-radius: 6px; padding: 2px 6px; color: #ffb86b; }
+    button { border: 0; border-radius: 8px; padding: 12px 16px; font-weight: 700; cursor: pointer; background: #2f81f7; color: white; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Confirm KEYRING Slack decision</h1>
+    <p>Slack link previews are ignored. Confirm <code>${escapeHtml(label)}</code> for <code>${safe.cli || 'railway'}</code>.</p>
+    <form method="post" action="/api/slack/decision">
+      ${hidden}
+      <button type="submit">${escapeHtml(label)}</button>
+    </form>
+  </main>
+</body>
+</html>`;
+}
+
+async function handleSlackDecision(params, res) {
+  const decision = params.decision;
+  const id = params.id;
+  const cli = params.cli || 'railway';
+  const token = params.token;
+  const version = params.version;
+  const subject = id || cli;
+  if (!slack.verifyDecisionToken(subject, decision, token, version)) {
+    return sendText(res, 403, 'KEYRING rejected this Slack link: bad or expired signature.');
+  }
+  const who = 'slack-link';
+  const allowedAction = decision === 'allow_10m' || decision === 'allow_forever' || decision === 'allow';
+  const before = id ? ap.getApproval(id) : null;
+  if (id && !before) {
+    return sendText(res, 404, 'KEYRING could not find that pending approval. This Slack approval link is stale.');
+  }
+  if (id && before.status !== 'pending') {
+    return sendText(res, 409, `KEYRING already ${before.status} this approval by ${before.approver || 'unknown'}.`);
+  }
+  if (decision === 'deny_future') {
+    const rule = core.denyProxyGrant(cli, { by: who, source: 'slack-link' });
+    return sendText(res, 200, `KEYRING denied future ${rule.cli} proxy approvals.`);
+  }
+  if (decision === 'require_approval') {
+    const rule = core.requireProxyApproval(cli, { by: who, source: 'slack-link' });
+    return sendText(res, 200, `KEYRING will require approval for the next ${rule.cli} proxy use.`);
+  }
+  if (!id && allowedAction) {
+    const currentRule = core.getAccessRule(cli) || core.ensureAccessRule(cli);
+    if (!version || version !== String(currentRule.updatedAt)) {
+      return sendText(res, 409, 'KEYRING ignored this stale Slack control link. Open the dashboard or use the latest Slack message.');
+    }
+    const rule = core.grantProxyAccess(cli, {
+      durationMs: decision === 'allow_10m' ? 10 * 60 * 1000 : null,
+      by: who,
+      source: 'slack-link'
+    });
+    return sendText(res, 200, `KEYRING approved ${rule.cli} proxy access${decision === 'allow_10m' ? ' for 10 minutes' : ' forever'}.`);
+  }
+  if (!id) return sendText(res, 400, 'KEYRING approval link is missing an approval id.');
+  if (allowedAction) {
+    core.grantProxyAccess((before && before.cli) || cli, {
+      durationMs: decision === 'allow_10m' ? 10 * 60 * 1000 : null,
+      by: who,
+      source: 'slack-link'
+    });
+  }
+  const status = allowedAction ? 'approved' : 'denied';
+  const resolved = ap.resolve(id, status, who);
+  if (resolved && before && before.slack && slack.isEnabled()) {
+    slack.update(before.slack, resolved, status, who, {
+      cli: before.cli || cli,
+      dashboardUrl: dashboardUrl()
+    }).catch(e => process.stderr.write(`slack.update failed: ${e.message}\n`));
+  }
+  return sendText(res, 200, status === 'approved'
+    ? `KEYRING approved ${before.cli || cli} proxy access${decision === 'allow_10m' ? ' for 10 minutes' : ' forever'}. You can close this tab.`
+    : `KEYRING denied ${before.cli || cli} proxy access. You can close this tab.`
+  );
 }
 
 const server = http.createServer(async (req, res) => {
@@ -99,6 +223,44 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === 'GET' && u.pathname === '/api/gates') {
     return send(res, 200, core.listGates());
+  }
+  if (req.method === 'GET' && u.pathname === '/api/access-rules') {
+    return send(res, 200, core.listAccessRules());
+  }
+  if (req.method === 'GET' && u.pathname.match(/^\/api\/access-rules\/[^/]+$/)) {
+    const name = decodeURIComponent(u.pathname.split('/')[3]);
+    return send(res, 200, core.getAccessRule(name) || core.ensureAccessRule(name));
+  }
+  if (req.method === 'POST' && u.pathname.match(/^\/api\/access-rules\/[^/]+\/(block|unblock)$/)) {
+    const parts = u.pathname.split('/');
+    const name = decodeURIComponent(parts[3]);
+    const action = parts[4];
+    const body = JSON.parse((await readBody(req)) || '{}');
+    const rule = core.setAccessRule(name, {
+      direct: action === 'block' ? 'blocked' : 'unblocked',
+      by: body.by || 'dashboard',
+      source: body.source || 'dashboard'
+    });
+    return send(res, 200, rule);
+  }
+  if (req.method === 'POST' && u.pathname.match(/^\/api\/access-rules\/[^/]+\/proxy$/)) {
+    const name = decodeURIComponent(u.pathname.split('/')[3]);
+    const body = JSON.parse((await readBody(req)) || '{}');
+    if (!['requires_approval', 'allowed', 'denied'].includes(body.proxy)) return send(res, 400, { error: 'invalid_proxy_access_state' });
+    const actor = body.by || 'dashboard';
+    const source = body.source || 'dashboard';
+    const rule = body.proxy === 'allowed'
+      ? core.grantProxyAccess(name, { durationMs: null, by: actor, source })
+      : body.proxy === 'denied'
+        ? core.denyProxyGrant(name, { by: actor, source })
+        : core.requireProxyApproval(name, { by: actor, source });
+    return send(res, 200, rule);
+  }
+  if (req.method === 'POST' && u.pathname.match(/^\/api\/access-rules\/[^/]+\/notify$/)) {
+    const name = decodeURIComponent(u.pathname.split('/')[3]);
+    const rule = core.getAccessRule(name) || core.ensureAccessRule(name);
+    const r = await slack.notifyAccessRule(rule, { dashboardUrl: dashboardUrl() });
+    return send(res, r.ok ? 200 : 500, r.ok ? r : { error: r.error });
   }
   if (req.method === 'GET' && u.pathname === '/api/discovered-clis') {
     const scanner = require('./scanner');
@@ -267,18 +429,68 @@ const server = http.createServer(async (req, res) => {
     }
     return send(res, 200, resolved);
   }
+  if (req.method === 'GET' && u.pathname === '/api/slack/decision') {
+    return send(res, 200, slackDecisionConfirmPage(Object.fromEntries(u.searchParams.entries())), 'text/html; charset=utf-8');
+  }
+  if (req.method === 'POST' && u.pathname === '/api/slack/decision') {
+    const raw = await readBody(req);
+    const contentType = req.headers['content-type'] || '';
+    const params = contentType.includes('application/json')
+      ? JSON.parse(raw || '{}')
+      : querystring.parse(raw);
+    return handleSlackDecision(params, res);
+  }
   if (req.method === 'POST' && u.pathname === '/api/slack/interactivity') {
     const raw = await readBody(req);
     const okSig = slack.verifySignature(raw, req.headers['x-slack-request-timestamp'], req.headers['x-slack-signature']);
     if (!okSig) return send(res, 401, { error: 'bad_signature' });
     const payload = JSON.parse(querystring.parse(raw).payload || '{}');
     const action = (payload.actions || [])[0] || {};
-    const status = action.action_id === 'allow' ? 'approved' : 'denied';
+    if (action.action_id && action.action_id.startsWith('proxy_link_')) {
+      return send(res, 200, '');
+    }
+    if (action.action_id === 'access_block' || action.action_id === 'access_unblock') {
+      const who = '@' + ((payload.user && payload.user.username) || 'slack');
+      const rule = core.setAccessRule(action.value || 'railway', {
+        direct: action.action_id === 'access_block' ? 'blocked' : 'unblocked',
+        by: who,
+        source: 'slack'
+      });
+      const target = payload.response_url ? { responseUrl: payload.response_url } : {};
+      if (target.responseUrl) {
+        slack.updateAccessRule(target, rule, who, { dashboardUrl: dashboardUrl() })
+          .catch(e => process.stderr.write(`slack.updateAccessRule failed: ${e.message}\n`));
+      }
+      return send(res, 200, '');
+    }
+    if (action.action_id === 'deny_future') {
+      const who = '@' + ((payload.user && payload.user.username) || 'slack');
+      const rule = core.denyProxyGrant(action.value || 'railway', {
+        by: who,
+        source: 'slack'
+      });
+      const target = payload.response_url ? { responseUrl: payload.response_url } : {};
+      if (target.responseUrl) {
+        slack.updateProxyUseDenied(target, rule, who, { dashboardUrl: dashboardUrl() })
+          .catch(e => process.stderr.write(`slack.updateProxyUseDenied failed: ${e.message}\n`));
+      }
+      return send(res, 200, '');
+    }
+    const allowedAction = action.action_id === 'allow_10m' || action.action_id === 'allow_forever' || action.action_id === 'allow';
+    const status = allowedAction ? 'approved' : 'denied';
     const who = '@' + ((payload.user && payload.user.username) || 'slack');
     const before = ap.getApproval(action.value);
     // If already resolved (race against dashboard), don't double-resolve — just acknowledge.
     if (before && before.status !== 'pending') {
       return send(res, 200, { text: `Already ${before.status} by ${before.approver}` });
+    }
+    if (allowedAction) {
+      const cli = (before && before.cli) || 'railway';
+      core.grantProxyAccess(cli, {
+        durationMs: action.action_id === 'allow_10m' ? 10 * 60 * 1000 : null,
+        by: who,
+        source: 'slack'
+      });
     }
     const resolved = ap.resolve(action.value, status, who);
     // If this Railway instance doesn't know the approval (state isn't shared with the

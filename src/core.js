@@ -3,6 +3,8 @@ const crypto = require('crypto');
 const { load, update } = require('./store');
 const SECRET = process.env.KEYRING_SIGNING_SECRET || 'dev-insecure-secret';
 const now = () => Date.now();
+const VALID_DIRECT = new Set(['blocked', 'unblocked']);
+const VALID_PROXY = new Set(['requires_approval', 'allowed', 'denied']);
 
 function sign(g) {
   return crypto.createHmac('sha256', SECRET)
@@ -145,6 +147,149 @@ function updateGate(name, patch) {
   });
 }
 
+// --- access rules (demo-friendly controls for direct CLI egress) ---
+function ensureAccessRule(cli, opts = {}) {
+  return update(s => {
+    if (!s.accessRules) s.accessRules = {};
+    if (!s.accessRules[cli]) {
+      s.accessRules[cli] = {
+        cli,
+        enforcement: opts.enforcement || 'real',
+        direct: opts.direct || 'blocked',
+        proxy: opts.proxy || 'requires_approval',
+        proxyGrant: opts.proxyGrant || null,
+        hosts: opts.hosts || defaultAllowHostsForGatedClis([cli]),
+        lastChangedBy: opts.by || 'system',
+        lastChangedSource: opts.source || 'system',
+        updatedAt: now()
+      };
+    }
+    return s.accessRules[cli];
+  });
+}
+function getAccessRule(cli) {
+  return (load().accessRules || {})[cli] || null;
+}
+function listAccessRules() {
+  return Object.values(load().accessRules || {});
+}
+function setAccessRule(cli, patch = {}) {
+  if (patch.direct && !VALID_DIRECT.has(patch.direct)) throw new Error('invalid_direct_access_state');
+  if (patch.proxy && !VALID_PROXY.has(patch.proxy)) throw new Error('invalid_proxy_access_state');
+  return update(s => {
+    if (!s.accessRules) s.accessRules = {};
+    const prev = s.accessRules[cli] || {
+      cli,
+      enforcement: 'real',
+      direct: 'blocked',
+      proxy: 'requires_approval',
+      proxyGrant: null,
+      hosts: defaultAllowHostsForGatedClis([cli])
+    };
+    let proxyGrant = Object.prototype.hasOwnProperty.call(patch, 'proxyGrant') ? patch.proxyGrant : prev.proxyGrant || null;
+    if (patch.proxy === 'denied' || patch.proxy === 'requires_approval') proxyGrant = null;
+    if (patch.proxy === 'allowed' && !proxyGrant) {
+      proxyGrant = {
+        grantedAt: now(),
+        grantedBy: patch.by || 'unknown',
+        source: patch.source || 'unknown',
+        exp: null
+      };
+    }
+    const next = {
+      ...prev,
+      enforcement: patch.enforcement || prev.enforcement,
+      direct: patch.direct || prev.direct,
+      proxy: patch.proxy || prev.proxy,
+      proxyGrant,
+      hosts: patch.hosts || prev.hosts,
+      lastChangedBy: patch.by || 'unknown',
+      lastChangedSource: patch.source || 'unknown',
+      updatedAt: now()
+    };
+    s.accessRules[cli] = next;
+    if (!s.audit) s.audit = [];
+    if (patch.direct && patch.direct !== prev.direct) {
+      s.audit.push({
+        ts: Date.now(),
+        taskId: patch.taskId || null,
+        host: null,
+        cli,
+        decision: patch.direct === 'blocked' ? 'blocked' : 'unblocked',
+        reason: patch.direct === 'blocked' ? 'direct_access_blocked' : 'direct_access_unblocked',
+        approver: patch.by || 'unknown',
+        source: patch.source || 'unknown'
+      });
+      if (s.audit.length > 500) s.audit = s.audit.slice(-500);
+    }
+    if (patch.proxy && patch.proxy !== prev.proxy) {
+      s.audit.push({
+        ts: Date.now(),
+        taskId: patch.taskId || null,
+        host: null,
+        cli,
+        decision: patch.proxy === 'denied' ? 'denied' : 'allowed',
+        reason: patch.proxy === 'denied' ? 'proxy_access_denied' : `proxy_access_${patch.proxy}`,
+        approver: patch.by || 'unknown',
+        source: patch.source || 'unknown'
+      });
+      if (s.audit.length > 500) s.audit = s.audit.slice(-500);
+    }
+    return next;
+  });
+}
+function proxyGrantActive(rule, at = now()) {
+  if (!rule || rule.proxy !== 'allowed') return false;
+  // Backward compatibility for older demo state where `proxy: allowed` existed
+  // before explicit grant metadata.
+  if (!rule.proxyGrant) return true;
+  if (!rule.proxyGrant.exp) return true;
+  return at <= rule.proxyGrant.exp;
+}
+function grantProxyAccess(cli, opts = {}) {
+  const durationMs = Object.prototype.hasOwnProperty.call(opts, 'durationMs') ? opts.durationMs : null;
+  const grantedAt = now();
+  return setAccessRule(cli, {
+    proxy: 'allowed',
+    proxyGrant: {
+      grantedAt,
+      grantedBy: opts.by || 'unknown',
+      source: opts.source || 'unknown',
+      exp: durationMs ? grantedAt + Number(durationMs) : null
+    },
+    by: opts.by || 'unknown',
+    source: opts.source || 'unknown'
+  });
+}
+function requireProxyApproval(cli, opts = {}) {
+  return setAccessRule(cli, {
+    proxy: 'requires_approval',
+    proxyGrant: null,
+    by: opts.by || 'unknown',
+    source: opts.source || 'unknown'
+  });
+}
+function denyProxyGrant(cli, opts = {}) {
+  return setAccessRule(cli, {
+    proxy: 'denied',
+    proxyGrant: null,
+    by: opts.by || 'unknown',
+    source: opts.source || 'unknown'
+  });
+}
+
+// --- runtime config shared between dashboard, CLI, and long-running proxy ---
+function setRuntimeConfig(patch = {}) {
+  return update(s => {
+    if (!s.runtimeConfig) s.runtimeConfig = {};
+    s.runtimeConfig = { ...s.runtimeConfig, ...patch, updatedAt: now() };
+    return s.runtimeConfig;
+  });
+}
+function getRuntimeConfig() {
+  return load().runtimeConfig || {};
+}
+
 // --- audit ---
 function addAudit(ev) {
   return update(s => {
@@ -164,5 +309,8 @@ module.exports = {
   hostAllowed, isSubset, coveredBy,
   addGate, listGates, getGate, removeGate, updateGate,
   defaultAllowHostsForGatedClis,
+  ensureAccessRule, getAccessRule, listAccessRules, setAccessRule,
+  proxyGrantActive, grantProxyAccess, requireProxyApproval, denyProxyGrant,
+  setRuntimeConfig, getRuntimeConfig,
   addAudit, getAudit
 };

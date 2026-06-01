@@ -32,6 +32,8 @@ DST_HELPER="/usr/local/libexec/keyring-helper"
 SUDOERS_FILE="/etc/sudoers.d/keyring"
 JAIL_USER="keyring-jail"
 JAIL_GROUP="keyring-jail"
+PROXY_USER="keyring-proxy"
+PROXY_GROUP="keyring-proxy"
 
 echo "==> KEYRING bootstrap"
 echo "    invoking user: $INVOKING_USER"
@@ -82,6 +84,24 @@ if ! id "$JAIL_USER" >/dev/null 2>&1; then
 else
   echo "    user exists:   $JAIL_USER"
 fi
+if ! id "$PROXY_USER" >/dev/null 2>&1; then
+  NEXT_UID=$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)
+  NEW_UID=$(( NEXT_UID + 1 ))
+  NEXT_GID=$(dscl . -list /Groups PrimaryGroupID | awk '{print $2}' | sort -n | tail -1)
+  NEW_GID=$(( NEXT_GID + 1 ))
+  dscl . -create "/Groups/$PROXY_GROUP" >/dev/null
+  dscl . -create "/Groups/$PROXY_GROUP" PrimaryGroupID "$NEW_GID" >/dev/null
+  dscl . -create "/Groups/$PROXY_GROUP" RealName "KEYRING egress proxy" >/dev/null
+  dscl . -create "/Users/$PROXY_USER" >/dev/null
+  dscl . -create "/Users/$PROXY_USER" UserShell /bin/sh >/dev/null
+  dscl . -create "/Users/$PROXY_USER" RealName "KEYRING egress proxy" >/dev/null
+  dscl . -create "/Users/$PROXY_USER" UniqueID "$NEW_UID" >/dev/null
+  dscl . -create "/Users/$PROXY_USER" PrimaryGroupID "$NEW_GID" >/dev/null
+  dscl . -create "/Users/$PROXY_USER" NFSHomeDirectory /var/empty >/dev/null
+  echo "    created user:  $PROXY_USER (uid=$NEW_UID gid=$NEW_GID)"
+else
+  echo "    user exists:   $PROXY_USER"
+fi
 
 # 4) pre-create log file so the helper can write
 touch /var/log/keyring-helper.log
@@ -131,6 +151,12 @@ echo "    bundled:     /usr/local/lib/keyring/ (so keyring-proxy uid can load th
 install -d -m 777 /var/lib/keyring   # not sticky — both axiom and keyring-proxy
                                       # need to rename/replace files in here
 echo "    state dir:   /var/lib/keyring (777, shared between axiom + keyring-proxy)"
+if [[ -f "$REPO_DIR/.env" ]]; then
+  grep -E '^(SLACK_BOT_TOKEN|SLACK_SIGNING_SECRET|SLACK_APPROVAL_CHANNEL|KEYRING_DASHBOARD_URL)=' "$REPO_DIR/.env" > /var/lib/keyring/proxy.env || true
+  chown "root:$PROXY_GROUP" /var/lib/keyring/proxy.env 2>/dev/null || true
+  chmod 640 /var/lib/keyring/proxy.env 2>/dev/null || true
+  echo "    proxy env:   /var/lib/keyring/proxy.env (Slack settings copied from .env, readable by $PROXY_USER)"
+fi
 # Migrate any pre-existing state from the repo dir on first install
 if [[ -f "$REPO_DIR/.keyring-state.json" && ! -f /var/lib/keyring/state.json ]]; then
   cp "$REPO_DIR/.keyring-state.json" /var/lib/keyring/state.json

@@ -1,5 +1,15 @@
 # KEYRING
 
+**Agentic Firewall to keep your local autonomous agents in check.**
+
+KEYRING is a firewall that sits between your autonomous agent and the powerful tools on your computer: local CLIs, MCP servers, APIs, and infrastructure commands. Instead of trusting an agent to always call the right thing, KEYRING watches the connection, blocks risky access by default, and asks a human before letting the agent through.
+
+In plain English: if an agent hallucinates, gets prompt-injected, or starts running wild, KEYRING is the checkpoint it has to pass first. Today that checkpoint is human-in-the-loop approval with real-time Slack/dashboard controls; next, KEYRING is adding real-time agentic assessment so requests can be judged before they touch your tools.
+
+KEYRING never needs to store your credentials. You stay logged in to tools like Railway, GitHub, or AWS yourself. The agent only gets a controlled route through KEYRING, and KEYRING decides whether that route is allowed.
+
+## Technical Summary
+
 **A policy egress proxy for AI agents. The agent can't reach your infrastructure without a human's say-so — and KEYRING never touches your credentials.**
 
 The human has already authenticated their tools (e.g. `railway login`). The agent runs network-jailed: its only route out is KEYRING. To reach an approved destination, the agent's traffic passes through KEYRING, which checks a task-scoped host allowlist, requires human approval (Slack or local), and only then opens the tunnel. The credential rides *inside* the TLS stream KEYRING never decrypts — so KEYRING gates **access**, it never stores or sees secrets.

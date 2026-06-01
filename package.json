@@ -1,10 +1,11 @@
 {
   "name": "keyring",
   "version": "0.1.0",
-  "description": "Policy egress proxy for AI agents — host-gated, human-approved, credential-free.",
+  "description": "Agentic Firewall to keep your local autonomous agents in check.",
   "bin": { "keyring": "bin/keyring" },
   "scripts": {
     "demo": "bash demo/run-demo.sh",
+    "demo:railway:preflight": "bash demo/run-railway-demo-preflight.sh",
     "test": "node test/core.test.js",
     "serve": "node bin/keyring serve",
     "start": "node bin/keyring serve"

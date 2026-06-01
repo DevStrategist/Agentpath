@@ -1,6 +1,7 @@
 // The heart of option 1: an HTTP CONNECT proxy that gates by DESTINATION HOST.
 // It never decrypts traffic — it sees only host:port from the CONNECT line, then allows or
 // refuses the tunnel based on the task's grant (host allowlist), task status, and human approval.
+require('./env').loadDotEnv();
 const http = require('http');
 const net = require('net');
 const core = require('./core');
@@ -8,9 +9,18 @@ const ap = require('./approver');
 const slack = require('./slack');
 
 const TASK = process.env.KEYRING_TASK;
-const TIMEOUT = parseInt(process.env.KEYRING_APPROVAL_TIMEOUT || '60000', 10);
+const TIMEOUT = parseInt(process.env.KEYRING_APPROVAL_TIMEOUT || '300000', 10);
 const AUTO = process.env.KEYRING_AUTO_APPROVE === '1';
 const PORT = parseInt(process.env.KEYRING_PROXY_PORT || '8080', 10);
+
+function dashboardUrl() {
+  return core.getRuntimeConfig().dashboardUrl || process.env.KEYRING_DASHBOARD_URL || undefined;
+}
+
+function inferCli(host, headers = {}) {
+  if (headers['x-keyring-cli']) return headers['x-keyring-cli'];
+  return host === 'railway.com' || host.endsWith('.railway.com') ? 'railway' : undefined;
+}
 
 function refuse(sock, code, reason) {
   try { sock.write(`HTTP/1.1 ${code} ${reason}\r\n\r\n`); } catch (e) {}
@@ -26,6 +36,8 @@ server.on('connect', async (req, clientSocket, head) => {
   const [host, portStr] = req.url.split(':');
   const port = parseInt(portStr || '443', 10);
   const taskId = TASK;
+  const cli = inferCli(host, req.headers);
+  let accessRule = cli ? (core.getAccessRule(cli) || core.ensureAccessRule(cli)) : null;
 
   // 1) task-binding: task must be active (catches cancelled/expired even if previously approved)
   const task = core.getTask(taskId);
@@ -44,25 +56,55 @@ server.on('connect', async (req, clientSocket, head) => {
     core.addAudit({ taskId, host, decision: 'denied', reason: 'host_not_in_scope' });
     return refuse(clientSocket, 403, 'Host Not In Scope');
   }
-  // 4) human approval, cached per (task, host)
-  let appr = ap.findApproval(taskId, host);
+  if (accessRule && accessRule.proxy === 'denied') {
+    core.addAudit({ taskId, host, decision: 'denied', reason: 'railway_access_disabled', cli, accessDirect: accessRule.direct });
+    return refuse(clientSocket, 403, 'Railway Access Disabled');
+  }
+
+  const recent = core.getAudit(taskId);
+  const buildCtx = (extra = {}) => ({
+    cli,
+    accessRule,
+    invoker: process.env.SUDO_USER || process.env.USER || undefined,
+    allowHosts: grant.allowHosts,
+    recentApproved: recent.filter(e => e.decision === 'allowed').length,
+    recentDenied: recent.filter(e => e.decision === 'denied').length,
+    dashboardUrl: dashboardUrl(),
+    ...extra
+  });
+
+  const hasActiveProxyGrant = core.proxyGrantActive(accessRule);
+  if (accessRule && accessRule.proxy === 'allowed' && !hasActiveProxyGrant) {
+    accessRule = core.requireProxyApproval(cli, {
+      by: 'system',
+      source: 'proxy-expired-grant',
+      taskId
+    });
+  }
+
+  // 4) human approval. Railway demo mode grants either 10 minutes or forever. While a
+  // grant is active, the proxy allows immediately and sends Slack a usage notification
+  // with a "deny future approvals" button.
+  const usesProxyGrant = cli === 'railway' && core.proxyGrantActive(accessRule);
+  if (usesProxyGrant) {
+    const ctx = buildCtx({ host, taskId });
+    slack.notifyProxyUse(accessRule, ctx).then(r => {
+      if (r && r.error && r.error !== 'slack_disabled') {
+        process.stderr.write(`[KEYRING] slack proxy-use notify failed: ${r.error}\n`);
+      }
+    }).catch(e => process.stderr.write(`[KEYRING] slack proxy-use notify threw: ${e.message}\n`));
+  }
+
+  let appr = usesProxyGrant
+    ? { status: 'approved', approver: (accessRule.proxyGrant && accessRule.proxyGrant.grantedBy) || accessRule.lastChangedBy || 'grant' }
+    : (cli === 'railway' ? null : ap.findApproval(taskId, host));
   if (appr && appr.status === 'denied') {
     core.addAudit({ taskId, host, decision: 'denied', reason: 'approval_denied', approver: appr.approver });
     return refuse(clientSocket, 403, 'Denied By Human');
   }
   if (!appr || appr.status === 'pending') {
-    const pending = appr || ap.createPending(taskId, host);
-
-    // Build rich context once so Slack and stderr both have it.
-    const recent = core.getAudit(taskId);
-    const ctx = {
-      cli: req.headers['x-keyring-cli'] || undefined,           // optional hint from `keyring run`
-      invoker: process.env.SUDO_USER || process.env.USER || undefined,
-      allowHosts: grant.allowHosts,
-      recentApproved: recent.filter(e => e.decision === 'allowed').length,
-      recentDenied: recent.filter(e => e.decision === 'denied').length,
-      dashboardUrl: process.env.KEYRING_DASHBOARD_URL || undefined
-    };
+    const pending = appr || ap.createPending(taskId, host, { cli });
+    const ctx = buildCtx({ host, taskId });
 
     // Fire Slack notification (best-effort) and persist the message id on the approval.
     slack.notify(pending, ctx).then(r => {
@@ -105,7 +147,14 @@ server.on('connect', async (req, clientSocket, head) => {
 
   // 5) open the tunnel — bytes are piped opaquely; KEYRING never sees inside TLS
   const upstream = net.connect(port, host, () => {
-    core.addAudit({ taskId, host, decision: 'allowed', reason: 'approved', approver: appr.approver });
+    core.addAudit({
+      taskId,
+      host,
+      decision: 'allowed',
+      reason: usesProxyGrant ? 'proxy_grant_active' : 'approved',
+      approver: appr.approver,
+      cli
+    });
     clientSocket.write('HTTP/1.1 200 Connection Established\r\nProxy-agent: keyring\r\n\r\n');
     if (head && head.length) upstream.write(head);
     upstream.pipe(clientSocket);

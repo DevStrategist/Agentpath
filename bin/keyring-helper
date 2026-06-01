@@ -174,9 +174,22 @@ case "$verb" in
     # Spawn as keyring-proxy uid, fully detached, stdio to log
     touch "$PROXY_LOG_FILE" 2>/dev/null || true
     chown "$PROXY_USER:$PROXY_GROUP" "$PROXY_LOG_FILE" 2>/dev/null || true
+    if [[ -f /var/lib/keyring/proxy.env ]]; then
+      chown "root:$PROXY_GROUP" /var/lib/keyring/proxy.env 2>/dev/null || true
+      chmod 640 /var/lib/keyring/proxy.env 2>/dev/null || true
+    fi
+    proxy_launch='
+      cd /var/empty 2>/dev/null || cd /tmp
+      if [ -f /var/lib/keyring/proxy.env ]; then
+        set -a
+        . /var/lib/keyring/proxy.env
+        set +a
+      fi
+      export KEYRING_PROXY_PORT="$1" KEYRING_TASK="$2" KEYRING_STATE="$3"
+      exec "$4" "$5/bin/keyring" proxy --task "$2" --port "$1"
+    '
     nohup sudo -u "$PROXY_USER" \
-      env KEYRING_PROXY_PORT="$port" KEYRING_TASK="$task" KEYRING_STATE="$state_file" \
-      "$node_bin" "$repo/bin/keyring" proxy --task "$task" --port "$port" \
+      /bin/sh -c "$proxy_launch" keyring-proxy-launch "$port" "$task" "$state_file" "$node_bin" "$repo" \
       >> "$PROXY_LOG_FILE" 2>&1 &
     new_pid=$!
     sleep 0.6
@@ -377,6 +390,50 @@ EOF
     cleanup_tmp_home() { rm -rf "$tmp_home" 2>/dev/null || true; }
     trap cleanup_tmp_home EXIT INT TERM HUP
 
+    auth_like_config() {
+      local cfg="${1:-}"
+      [[ -f "$cfg" ]] || return 1
+      grep -Eiq '"(accessToken|refreshToken|authToken|token|auth)"[[:space:]]*:' "$cfg"
+    }
+
+    sync_back_configs() {
+      [[ -n "$paths_csv" ]] || return 0
+      invoker_group=$(id -gn "$invoker" 2>/dev/null || echo staff)
+      local synced=0
+      IFS=',' read -ra SYNC_REL_PATHS <<< "$paths_csv"
+      for rel in "${SYNC_REL_PATHS[@]}"; do
+        rel="${rel## }"; rel="${rel%% }"
+        [[ -z "$rel" ]] && continue
+        case "$rel" in
+          /*|*..*) j_err "bad_config_path" ;;
+        esac
+        src="$tmp_home/$rel"
+        dst="$invoker_home/$rel"
+        if [[ -e "$src" ]]; then
+          mkdir -p "$(dirname "$dst")"
+          if [[ "$rel" == ".railway" && -d "$src" && -f "$dst/config.json" ]] &&
+             auth_like_config "$dst/config.json" &&
+             ! auth_like_config "$src/config.json"; then
+            # preserve_railway_auth_config: Railway may write notices/telemetry in
+            # the sandbox during a read-only command. Do not let that replace the
+            # user's real auth-bearing config with an authless sandbox copy.
+            preserved_config=$(mktemp)
+            cp "$dst/config.json" "$preserved_config"
+            mkdir -p "$dst"
+            cp -R "$src/." "$dst/" 2>/dev/null || true
+            cp "$preserved_config" "$dst/config.json"
+            rm -f "$preserved_config"
+          else
+            rm -rf "$dst"
+            cp -R "$src" "$dst"
+          fi
+          chown -R "$invoker:$invoker_group" "$dst"
+          synced=$((synced + 1))
+        fi
+      done
+      log "config-sync-back invoker=$invoker paths=$paths_csv count=$synced"
+    }
+
     # Copy each requested config dir/file into the temp HOME with the same relative path.
     # paths_csv is a comma-separated list of paths RELATIVE to invoker_home (e.g. ".railway,.config/gh").
     if [[ -n "$paths_csv" ]]; then
@@ -414,6 +471,9 @@ EOF
         KEYRING_INVOKER="$invoker" \
       "$bin" "$@"
     rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      sync_back_configs
+    fi
     cleanup_tmp_home
     # Don't emit JSON here — stdio was used by the child. Just exit with the child's code.
     exit $rc
