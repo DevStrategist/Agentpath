@@ -265,7 +265,7 @@ ok('keyring run preflights denied proxy state before launching real cli', (() =>
     cliSource.includes("accessRule.proxy === 'denied'");
 })());
 ok('keyring run asks Slack before launching railway when approval is required', (() => {
-  const cliSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8');
+  const cliSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'cli.js'), 'utf8').replace(/\r\n/g, '\n');
   const preflight = cliSource.indexOf('await ensureRailwayProxyApproval');
   const launch = cliSource.indexOf("'run',\n        invoker, configPaths");
   return preflight >= 0 &&
